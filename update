@@ -1,642 +1,513 @@
+local RAW = "https://raw.githubusercontent.com/salesmanhappymask/Miner-2/main/"
+local MIN_VERSION = 120
+local CONFIG = "updater.cfg"
 local args = {...}
 
-local RELEASE_VERSION = 33
-local MASTER_ID = 2700
-local SLAVE_ID = 2701
-
-local BASE_URL = "https://raw.githubusercontent.com/salesmanhappymask/Cairn/main/"
-local UPDATE_PROTOCOL = "cairn.drive.update"
-
-local TEMP = "cairn_update_new"
-local STAGE = "cairn_update_stage"
-local VERSION_FILE = "cairn_version"
-local STATE_FILE = "cairn_drive_state"
-local FILES = {"startup", "cairn", "update", "push", "pushlogs"}
-local CHUNK_SIZE = 3000
-
-local LEGACY_VERSION_FILE = ".cairn_version"
-local LEGACY_STATE_FILE = ".cairn_drive.tmp"
-
-local MASTER_WIRED_SIDE = "left"
-
-local SIDES = {
-    "top",
-    "bottom",
-    "left",
-    "right",
-    "front",
-    "back"
-}
-
-
-local function migrateLegacyFiles()
-    if fs.exists(LEGACY_STATE_FILE) then
-        if not fs.exists(STATE_FILE) then
-            fs.move(LEGACY_STATE_FILE, STATE_FILE)
-        else
-            fs.delete(LEGACY_STATE_FILE)
-        end
-    end
-
-    if fs.exists(LEGACY_VERSION_FILE) then
-        if not fs.exists(VERSION_FILE) then
-            fs.move(LEGACY_VERSION_FILE, VERSION_FILE)
-        else
-            fs.delete(LEGACY_VERSION_FILE)
-        end
-    end
-end
-
-local function readAll(path)
-    if not fs.exists(path) then
-        return nil
-    end
-
-    local h = fs.open(path, "r")
-    if not h then
-        return nil
-    end
-
-    local data = h.readAll()
-    h.close()
+local function readFile(path)
+    local file = fs.open(path, "r")
+    if not file then return nil end
+    local data = file.readAll()
+    file.close()
     return data
 end
 
-local function writeAll(path, data)
-    local h = fs.open(path, "w")
-    if not h then
-        return false
-    end
-
-    h.write(data)
-    h.close()
-    return true
+local function canonicalText(data)
+    data = tostring(data or "")
+    data = data:gsub("\r\n", "\n")
+    data = data:gsub("\r", "\n")
+    data = data:gsub("\n+$", "")
+    return data
 end
 
-local function releaseOf(name, data)
-    local pattern
-
-    if name == "update" then
-        pattern = "local%s+RELEASE_VERSION%s*=%s*(%d+)"
-    else
-        pattern = "local%s+CAIRN_RELEASE%s*=%s*(%d+)"
+local function writeFile(path, data)
+    local file = fs.open(path, "w")
+    if not file then error("Cannot write " .. path) end
+    file.write(data)
+    file.close()
+    local actual = readFile(path)
+    if actual ~= data then
+        local expectedLength = #data
+        local actualLength = actual and #actual or 0
+        local firstDifference = nil
+        if actual then
+            local limit = math.min(expectedLength, actualLength)
+            for i = 1, limit do
+                if data:byte(i) ~= actual:byte(i) then
+                    firstDifference = i
+                    break
+                end
+            end
+            if not firstDifference and expectedLength ~= actualLength then
+                firstDifference = limit + 1
+            end
+        end
+        error("Verification failed: " .. path .. "; expected " .. expectedLength ..
+            " bytes, read " .. actualLength ..
+            (firstDifference and "; first difference " .. firstDifference or ""))
     end
-
-    local value = string.match(data, pattern)
-
-    if not value then
-        return nil
-    end
-
-    return tonumber(value)
 end
 
 local function fetch(name)
-    if not http or not http.get then
-        return nil, "HTTP API unavailable"
-    end
-
-    local token =
-        tostring(os.getComputerID()) ..
-        "_" ..
-        tostring(math.floor(os.clock() * 1000))
-
-    local ok, handle, err = pcall(
-        http.get,
-        BASE_URL .. name .. "?cairn=" .. token
-    )
-
-    if not ok then
-        return nil, tostring(handle)
-    end
-
-    if not handle then
-        return nil, tostring(err or "HTTP request failed")
-    end
-
-    local data = handle.readAll()
-    handle.close()
-
-    if not data or data == "" then
-        return nil, "Empty response"
-    end
-
+    local response = http.get(RAW .. name)
+    if not response then error("Could not download " .. name .. "; nothing was changed") end
+    local data = response.readAll()
+    response.close()
+    data = canonicalText(data)
+    if data == "" then error("Empty " .. name .. "; nothing was changed") end
     return data
 end
 
-local function validate(path)
-    local fn, err = loadfile(path)
-
-    if not fn then
-        return false, err
-    end
-
-    return true
+local function normalize(value)
+    value = tostring(value or ""):lower()
+    if value == "1" or value == "rm" or value == "manager" or value == "regional" then return "manager" end
+    if value == "2" or value == "mf" or value == "master" or value == "foreman1" or value == "foreman-1" then return "master" end
+    return nil
 end
 
-local function installed()
-    local data = readAll(VERSION_FILE)
-
-    if not data then
-        return "unknown"
-    end
-
-    data = string.gsub(data, "%s+", "")
-
-    if data == "" then
-        return "unknown"
-    end
-
-    return data
+local function roleName(role)
+    if role == "manager" then return "Regional Manager" end
+    return "Master Foreman"
 end
 
-local function openMasterWired()
-    if peripheral.getType(MASTER_WIRED_SIDE) ~= "modem" then
-        return nil, "Drive2 requires its wired modem on left"
-    end
-
-    local ok, wireless = pcall(
-        peripheral.call,
-        MASTER_WIRED_SIDE,
-        "isWireless"
-    )
-
-    if not ok or wireless ~= false then
-        return nil, "Drive2 left modem is not a wired modem"
-    end
-
-    if not rednet.isOpen(MASTER_WIRED_SIDE) then
-        rednet.open(MASTER_WIRED_SIDE)
-    end
-
-    return MASTER_WIRED_SIDE
+local function loadConfig()
+    local raw = readFile(CONFIG)
+    if not raw then return nil end
+    local ok, value = pcall(textutils.unserialize, raw)
+    if not ok or type(value) ~= "table" then return nil end
+    value.role = normalize(value.role)
+    if not value.role then return nil end
+    return value
 end
 
-local function waitAck(session, stage, name, index, timeout)
-    local deadline = os.clock() + timeout
+local function saveConfig(role)
+    writeFile(CONFIG, textutils.serialize({role = role}))
+end
 
-    while os.clock() < deadline do
-        local remaining = deadline - os.clock()
-        local sender, message, protocol = rednet.receive(UPDATE_PROTOCOL, remaining)
+local running = shell.getRunningProgram() or ""
+local fromDisk = running:match("^/?disk/") ~= nil
+local autoReboot=false
+local preserveState=false
+local explicitRole=nil
+for _,arg in ipairs(args) do
+    if arg=="--reboot" or arg=="--auto-reboot" then
+        autoReboot=true
+    elseif arg=="--preserve-state" then
+        error("State-preserving updates are disabled. All updates are clean reinstalls.")
+    elseif not explicitRole then
+        explicitRole=normalize(arg)
+    end
+end
 
-        if not sender then
-            return false, "timeout"
+if fromDisk then
+    local role=explicitRole
+    if not role then
+        print("Install permanent updater for:")
+        print("1. Regional Manager")
+        print("2. Master Foreman")
+        role=normalize(read())
+    end
+    if not role then error("Select Regional Manager or Master Foreman") end
+    local source = readFile(running)
+    if not source then error("Cannot read updater from disk") end
+    writeFile("update.new", source)
+    if fs.exists("update") then fs.delete("update") end
+    fs.move("update.new", "update")
+    saveConfig(role)
+    print("")
+    print("Permanent updater installed for " .. roleName(role) .. ".")
+    print("Remove this disk. You will not need it for normal updates again.")
+    print("From now on, run: update")
+    return
+end
+
+local config = loadConfig()
+if not config then
+    error("Updater role is not configured. Install it once with disk/update")
+end
+
+local requestedRole=explicitRole
+if requestedRole and requestedRole ~= config.role then
+    error("This updater is permanently configured for " .. roleName(config.role))
+end
+
+if not turtle or not turtle.forward then error("Update requires a turtle") end
+
+local role = config.role
+local function validAnchor(value)
+    return type(value) == "table" and type(value.x) == "number" and
+        type(value.y) == "number" and type(value.z) == "number"
+end
+
+local function loadSerialized(path)
+    local raw = readFile(path)
+    if not raw then return nil end
+    local ok, value = pcall(textutils.unserialize, raw)
+    if not ok then return nil end
+    return value
+end
+
+local anchor
+if role == "master" then
+    local existing = loadSerialized("world_anchor")
+    if validAnchor(existing) then
+        anchor = existing
+    else
+        local node = loadSerialized("node.cfg")
+        if type(node) == "table" and validAnchor(node.worldOrigin) then
+            anchor = {
+                x = node.worldOrigin.x,
+                y = node.worldOrigin.y,
+                z = node.worldOrigin.z + 1
+            }
+            print("Recovered Master Foreman world anchor from node.cfg.")
         end
+    end
 
-        if sender == SLAVE_ID and type(message) == "table" then
-            if message.type == "update_error" and message.session == session then
-                return false, tostring(message.error or "Drive1 update error")
-            end
+    if not anchor and gps and gps.locate then
+        local ok, x, y, z = pcall(gps.locate, 2, false)
+        if ok and type(x) == "number" and type(y) == "number" and type(z) == "number" then
+            anchor = {x = x, y = y, z = z}
+            print("Recovered Master Foreman world anchor from GPS.")
+        end
+    end
 
-            if message.type == "update_ack" and message.session == session then
-                if message.stage == stage then
-                    if name == nil or message.name == name then
-                        if index == nil or message.index == index then
-                            return true
-                        end
-                    end
+    if not anchor then
+        anchor = {}
+        print("Master Foreman world anchor is missing.")
+        print("Enter this turtle's current Minecraft coordinates once.")
+        for _, axis in ipairs({"x", "y", "z"}) do
+            while true do
+                term.write(axis:upper() .. ": ")
+                local value = tonumber(read())
+                if value and value == math.floor(value) then
+                    anchor[axis] = value
+                    break
                 end
+                print("Enter a whole-number coordinate.")
             end
         end
     end
-
-    return false, "timeout"
 end
 
-local function pushSlave(files)
-    local wiredSide, wiredError = openMasterWired()
-
-    if not wiredSide then
-        return false, wiredError or "Drive2 wired modem unavailable"
-    end
-
-    local session =
-        tostring(os.getComputerID()) ..
-        ":" ..
-        tostring(RELEASE_VERSION) ..
-        ":" ..
-        tostring(math.floor(os.clock() * 1000))
-
-    rednet.send(SLAVE_ID, {
-        type = "update_begin",
-        session = session,
-        version = RELEASE_VERSION,
-        files = FILES
-    }, UPDATE_PROTOCOL)
-
-    local ok, err = waitAck(session, "begin", nil, nil, 3)
-
-    if not ok then
-        return false, "Drive1 did not begin update: " .. tostring(err)
-    end
-
-    for _, name in ipairs(FILES) do
-        rednet.send(SLAVE_ID, {
-            type = "file_begin",
-            session = session,
-            name = name
-        }, UPDATE_PROTOCOL)
-
-        ok, err = waitAck(session, "file_begin", name, nil, 3)
-
-        if not ok then
-            return false, "Drive1 rejected " .. name .. ": " .. tostring(err)
-        end
-
-        local data = files[name]
-        local index = 1
-        local offset = 1
-
-        while offset <= #data do
-            local chunk = string.sub(data, offset, offset + CHUNK_SIZE - 1)
-
-            rednet.send(SLAVE_ID, {
-                type = "file_chunk",
-                session = session,
-                name = name,
-                index = index,
-                data = chunk
-            }, UPDATE_PROTOCOL)
-
-            ok, err = waitAck(session, "file_chunk", name, index, 3)
-
-            if not ok then
-                return false, "Drive1 chunk failed for " .. name .. ": " .. tostring(err)
-            end
-
-            offset = offset + CHUNK_SIZE
-            index = index + 1
-        end
-
-        rednet.send(SLAVE_ID, {
-            type = "file_end",
-            session = session,
-            name = name
-        }, UPDATE_PROTOCOL)
-
-        ok, err = waitAck(session, "file_end", name, nil, 3)
-
-        if not ok then
-            return false, "Drive1 validation failed for " .. name .. ": " .. tostring(err)
-        end
-    end
-
-    rednet.send(SLAVE_ID, {
-        type = "commit",
-        session = session
-    }, UPDATE_PROTOCOL)
-
-    ok, err = waitAck(session, "commit", nil, nil, 3)
-
-    if not ok then
-        return false, "Drive1 commit failed: " .. tostring(err)
-    end
-
-    return true
-end
-
-local function stageRelease()
-    if fs.exists(STAGE) then
-        fs.delete(STAGE)
-    end
-
-    fs.makeDir(STAGE)
-
-    local downloaded = {}
-
-    for _, name in ipairs(FILES) do
-        print("Downloading " .. name)
-
-        local data, err = fetch(name)
-
-        if not data then
-            fs.delete(STAGE)
-            return nil, "Download failed: " .. name .. ": " .. tostring(err or "")
-        end
-
-        local release = releaseOf(name, data)
-
-        if release ~= RELEASE_VERSION then
-            fs.delete(STAGE)
-            return nil,
-                "Release mismatch: " ..
-                name ..
-                " is v" ..
-                tostring(release) ..
-                ", expected v" ..
-                RELEASE_VERSION
-        end
-
-        local path = fs.combine(STAGE, name)
-
-        if not writeAll(path, data) then
-            fs.delete(STAGE)
-            return nil, "Could not stage " .. name
-        end
-
-        local ok, syntaxErr = validate(path)
-
-        if not ok then
-            fs.delete(STAGE)
-            return nil, "Validation failed: " .. name .. ": " .. tostring(syntaxErr or "")
-        end
-
-        downloaded[name] = data
-    end
-
-    return downloaded
-end
-
-local function wipeWritableRoot(keep)
-    keep = keep or {}
-    local rootDrive = fs.getDrive("")
-
-    for _, name in ipairs(fs.list("")) do
-        local okDrive, drive = pcall(fs.getDrive, name)
-        local writable = okDrive and drive == rootDrive and not fs.isReadOnly(name)
-
-        if writable and not keep[name] then
-            local ok, err = pcall(fs.delete, name)
-
+local function prepareFreshRoot()
+    local keep={
+        update=true
+    }
+    local rootDrive=fs.getDrive("")
+    local failures={}
+    for _,name in ipairs(fs.list("")) do
+        local okDrive,drive=pcall(fs.getDrive,name)
+        local writableRoot=okDrive and drive==rootDrive
+        if writableRoot and not keep[name] then
+            local ok,err=pcall(fs.delete,name)
             if not ok or fs.exists(name) then
-                return false, "Could not clear " .. name .. ": " .. tostring(err or "delete failed")
+                failures[#failures+1]=name .. (err and (": " .. tostring(err)) or "")
             end
         end
     end
-
-    return true
-end
-
-local function installStagedFollower()
-    local wiped, wipeErr = wipeWritableRoot({
-        [STAGE] = true,
-        [TEMP] = true
-    })
-
-    if not wiped then
-        error(wipeErr)
-    end
-
-    for _, name in ipairs(FILES) do
-        local source = fs.combine(STAGE, name)
-        fs.move(source, name)
-    end
-
-    if fs.exists(STAGE) then
-        fs.delete(STAGE)
-    end
-
-    if fs.exists(TEMP) then
-        fs.delete(TEMP)
-    end
-
-    writeAll(VERSION_FILE, tostring(RELEASE_VERSION))
-
-    print("Drive1 bootstrap complete")
-    print("Installed release: v" .. RELEASE_VERSION)
-    print("Writable root was cleared before reinstalling.")
-    print("Rebooting...")
-    sleep(1)
-    os.reboot()
-end
-
-local function slaveBootstrap()
-    print("CAIRN Drive1 bootstrap/recovery")
-    print("Installed release: v" .. installed())
-    print("Checking GitHub...")
-
-    local data, err = fetch("update")
-
-    if not data then
-        print("Updater download failed")
-        print(err or "")
-        return
-    end
-
-    local release = releaseOf("update", data)
-
-    if not release then
-        print("Downloaded updater has no release number")
-        return
-    end
-
-    print("Downloaded updater release: v" .. release)
-
-    if fs.exists(TEMP) then
-        fs.delete(TEMP)
-    end
-
-    if not writeAll(TEMP, data) then
-        print("Could not write temporary updater")
-        return
-    end
-
-    local ok, syntaxErr = validate(TEMP)
-
-    if not ok then
-        fs.delete(TEMP)
-        print("Downloaded updater failed validation")
-        print(syntaxErr or "")
-        return
-    end
-
-    print("Running slave bootstrap...")
-    shell.run(TEMP, "--apply-slave")
-
-    if fs.exists(TEMP) then
-        fs.delete(TEMP)
+    if #failures>0 then
+        error("Fresh update could not clear old writable root files: " .. table.concat(failures, ", "))
     end
 end
 
-local function applySlave()
-    if os.getComputerID() ~= SLAVE_ID then
-        print("Slave bootstrap is only valid on Drive1 / 2701")
-        return
-    end
-
-    print("Installing Drive1 release v" .. RELEASE_VERSION)
-
-    local downloaded, err = stageRelease()
-
-    if not downloaded then
-        print(err or "Follower staging failed")
-        return
-    end
-
-    print("All files verified as v" .. RELEASE_VERSION)
-    installStagedFollower()
-end
-
-local function bootstrapMain()
-    print("CAIRN updater")
-    print("Installed release: v" .. installed())
-    print("Checking GitHub...")
-
-    local data, err = fetch("update")
-
-    if not data then
-        print("Updater download failed")
-        print(err or "")
-        return
-    end
-
-    local release = releaseOf("update", data)
-
-    if not release then
-        print("Downloaded updater has no release number")
-        return
-    end
-
-    print("Downloaded updater release: v" .. release)
-
-    if fs.exists(TEMP) then
-        fs.delete(TEMP)
-    end
-
-    if not writeAll(TEMP, data) then
-        print("Could not write temporary updater")
-        return
-    end
-
-    local ok, syntaxErr = validate(TEMP)
-
-    if not ok then
-        fs.delete(TEMP)
-        print("Downloaded updater failed validation")
-        print(syntaxErr or "")
-        return
-    end
-
-    print("Running downloaded updater...")
-    shell.run(TEMP, "--apply")
-
-    if fs.exists(TEMP) then
-        fs.delete(TEMP)
-    end
-end
-
-local function applyMain()
-    print("Applying CAIRN release v" .. RELEASE_VERSION)
-
-    local downloaded, err = stageRelease()
-
-    if not downloaded then
-        print(err or "Staging failed")
-        return
-    end
-
-    print("All files verified as v" .. RELEASE_VERSION)
-    print("Synchronizing Drive1 slave over wired link...")
-
-    local pushed, pushErr = pushSlave(downloaded)
-
-    if not pushed then
-        fs.delete(STAGE)
-        print("Drive1 synchronization failed")
-        print(pushErr or "")
-        print("Nothing was changed on Drive2")
-        print("If Drive1 is not yet bootstrapped, run update on Drive1 once")
-        return
-    end
-
-    print("Drive1 first synchronization complete")
-    print("Waiting for Drive1 to reboot into v" .. RELEASE_VERSION .. "...")
-    sleep(2)
-
-    local cleanPushed = false
-    local cleanError = nil
-
-    for attempt = 1, 3 do
-        print("Drive1 clean reinstall pass " .. tostring(attempt) .. "/3")
-        cleanPushed, cleanError = pushSlave(downloaded)
-
-        if cleanPushed then
+local files = {"startup", "common", "prep", "push", "pushlogs", role == "manager" and "manager" or "foreman"}
+if role=="manager" then files[#files+1]="cairn_dock" end
+local staged = {}
+local updaterSource
+local version
+local commonVersion
+local workerInstallerVersion
+local masterSetupVersion
+local auxiliary={}
+local snapshotReady = false
+for attempt = 1, 6 do
+    staged = {}
+    local before = fetch("version"):match("^%s*(%d+)%s*$")
+    if before and tonumber(before) >= MIN_VERSION then
+        updaterSource = fetch("update")
+        for _, name in ipairs(files) do
+            staged[name] = fetch(name)
+        end
+        auxiliary.worker_disk_startup=fetch("worker_disk_startup")
+        auxiliary.master_setup_startup=fetch("master_setup_startup")
+        commonVersion = staged.common:match("^%s*VERSION%s*=%s*(%d+)")
+        workerInstallerVersion=auxiliary.worker_disk_startup:match("local%s+EXPECTED_VERSION%s*=%s*(%d+)")
+        masterSetupVersion=auxiliary.master_setup_startup:match("local%s+VERSION%s*=%s*(%d+)")
+        local after = fetch("version"):match("^%s*(%d+)%s*$")
+        if before == after and commonVersion == before and workerInstallerVersion == before and masterSetupVersion == before then
+            version = before
+            snapshotReady = true
             break
         end
+    end
+    if attempt < 6 then sleep(1) end
+end
+if not snapshotReady then
+    error("Remote release is inconsistent after 6 checks; version=" .. tostring(version or fetch("version"):match("^%s*(%d+)%s*$")) .. ", common=" .. tostring(commonVersion) .. ", worker=" .. tostring(workerInstallerVersion) .. ", master_setup=" .. tostring(masterSetupVersion) .. ". Re-upload the complete release with version last; nothing was changed")
+end
 
-        if attempt < 3 then
-            sleep(1.5)
+local regional = role == "manager" and "1" or "0"
+local master = role == "master" and "1" or "0"
+local regionalCount, masterCount
+staged.startup, regionalCount = staged.startup:gsub(
+    "local%s+REGIONAL_MANAGER%s*=%s*%d+", "local REGIONAL_MANAGER = " .. regional, 1)
+staged.startup, masterCount = staged.startup:gsub(
+    "local%s+MASTER_FOREMAN%s*=%s*%d+", "local MASTER_FOREMAN = " .. master, 1)
+if regionalCount ~= 1 or masterCount ~= 1 then
+    error("Startup role flags missing; nothing was changed")
+end
+
+local compile = loadstring or load
+if compile then
+    for _, name in ipairs(files) do
+        local fn, err = compile(staged[name], name)
+        if not fn then error("Invalid " .. name .. ": " .. tostring(err) .. "; nothing was changed") end
+    end
+    local updaterFn, updaterErr = compile(updaterSource, "update")
+    if not updaterFn then error("Invalid remote updater: " .. tostring(updaterErr) .. "; nothing was changed") end
+    for name,source in pairs(auxiliary) do
+        local fn,err=compile(source,name)
+        if not fn then error("Invalid remote "..name..": "..tostring(err).."; nothing was changed") end
+    end
+end
+
+if fetch("version"):match("^%s*(%d+)%s*$") ~= version then
+    error("Remote version changed after snapshot validation; nothing was changed")
+end
+
+if not preserveState then
+    prepareFreshRoot()
+end
+
+local stageDir = ".update_stage"
+if fs.exists(stageDir) then fs.delete(stageDir) end
+fs.makeDir(stageDir)
+for _, name in ipairs(files) do
+    writeFile(fs.combine(stageDir, name), staged[name])
+end
+writeFile(fs.combine(stageDir, "version"), version)
+writeFile(fs.combine(stageDir, "update"), updaterSource)
+
+if not preserveState then
+    local installOrder={}
+    for _,name in ipairs(files) do installOrder[#installOrder+1]=name end
+    installOrder[#installOrder+1]="version"
+    for _,name in ipairs(installOrder) do
+        local stagedPath=fs.combine(stageDir,name)
+        if not fs.exists(stagedPath) then
+            error("Fresh update staging lost " .. name)
+        end
+        if fs.exists(name) then fs.delete(name) end
+        fs.move(stagedPath,name)
+    end
+
+    writeFile("update.new", updaterSource)
+    if fs.exists("update.old") then fs.delete("update.old") end
+    local movedOld=false
+    if fs.exists("update") then
+        fs.move("update","update.old")
+        movedOld=true
+    end
+    local okUpdater,updaterErr=pcall(fs.move,"update.new","update")
+    if not okUpdater or not fs.exists("update") then
+        if fs.exists("update") then fs.delete("update") end
+        if movedOld and fs.exists("update.old") then fs.move("update.old","update") end
+        error("Fresh update updater self-refresh failed: " .. tostring(updaterErr))
+    end
+    if readFile("update") ~= updaterSource then
+        if fs.exists("update") then fs.delete("update") end
+        if movedOld and fs.exists("update.old") then fs.move("update.old","update") end
+        error("Fresh update updater verification failed; previous updater restored")
+    end
+    if fs.exists("update.old") then fs.delete("update.old") end
+
+    saveConfig(role)
+    if role=="master" and anchor then
+        writeFile("world_anchor", textutils.serialize(anchor))
+    end
+    writeFile(".clean_install_release", version)
+    if fs.exists(stageDir) then fs.delete(stageDir) end
+
+    for _, name in ipairs(files) do
+        if readFile(name) ~= staged[name] then
+            error("Fresh update verification failed: " .. name)
         end
     end
-
-    if not cleanPushed then
-        fs.delete(STAGE)
-        print("Drive1 clean reinstall pass failed")
-        print(cleanError or "")
-        print("Nothing was changed on Drive2")
-        return
+    if readFile("version") ~= version then
+        error("Fresh update verification failed: version")
+    end
+    local verifyConfig=loadConfig()
+    if not verifyConfig or verifyConfig.role~=role then
+        error("Fresh update verification failed: updater role")
     end
 
-    print("Drive1 clean reinstall verified")
-    print("Installing Drive2...")
-
-    local wiped, wipeErr = wipeWritableRoot({
-        [TEMP] = true,
-        [STAGE] = true
-    })
-
-    if not wiped then
-        fs.delete(STAGE)
-        print("Drive2 clean reinstall failed")
-        print(wipeErr or "")
-        return
+    if role == "manager" then
+        os.setComputerLabel("Regional Manager")
+    else
+        os.setComputerLabel("Foreman-1")
     end
 
-    for _, name in ipairs(FILES) do
-        local source = fs.combine(STAGE, name)
+    print("")
+    print("Update complete.")
+    print("Installed version " .. version .. " for " .. roleName(role) .. ".")
+    print("The turtle writable root was wiped before the fresh runtime was installed.")
+    if autoReboot then
+        print("Rebooting into the updated release...")
+        sleep(1)
+        os.reboot()
+    end
+    print("No program was launched and the turtle was not rebooted.")
+    print("Run startup or reboot when you are ready to start the quarry software.")
+    return
+end
 
+local backupDir = ".update_backup"
+if fs.exists(backupDir) then fs.delete(backupDir) end
+fs.makeDir(backupDir)
+
+local managed = {}
+for _, name in ipairs(files) do managed[#managed+1] = name end
+managed[#managed+1] = "version"
+
+for _, name in ipairs(managed) do
+    if fs.exists(name) then
+        fs.move(name, fs.combine(backupDir, name))
+    end
+end
+
+local committed = {}
+local okCommit, commitErr = pcall(function()
+    for _, name in ipairs(files) do
+        fs.move(fs.combine(stageDir, name), name)
+        committed[#committed+1] = name
+    end
+    fs.move(fs.combine(stageDir, "version"), "version")
+    committed[#committed+1] = "version"
+end)
+
+local function restoreManagedFiles()
+    for _, name in ipairs(managed) do
+        if fs.exists(name) then fs.delete(name) end
+        local backup = fs.combine(backupDir, name)
+        if fs.exists(backup) then fs.move(backup, name) end
+    end
+end
+
+if not okCommit then
+    restoreManagedFiles()
+    if fs.exists(stageDir) then fs.delete(stageDir) end
+    if fs.exists(backupDir) then fs.delete(backupDir) end
+    error("Update commit failed and previous runtime files were restored: " .. tostring(commitErr))
+end
+
+for _, name in ipairs(files) do
+    if readFile(name) ~= staged[name] then
+        restoreManagedFiles()
+        if fs.exists(stageDir) then fs.delete(stageDir) end
+        if fs.exists(backupDir) then fs.delete(backupDir) end
+        error("Final verification failed: " .. name .. "; previous runtime files restored")
+    end
+end
+if readFile("version") ~= version then
+    restoreManagedFiles()
+    if fs.exists(stageDir) then fs.delete(stageDir) end
+    if fs.exists(backupDir) then fs.delete(backupDir) end
+    error("Final verification failed: version; previous runtime files restored")
+end
+
+saveConfig(role)
+
+if fs.exists(stageDir) then fs.delete(stageDir) end
+if fs.exists(backupDir) then fs.delete(backupDir) end
+
+if anchor and preserveState then
+    writeFile("world_anchor", textutils.serialize(anchor))
+end
+writeFile("update.new", updaterSource)
+if fs.exists("update.old") then fs.delete("update.old") end
+if fs.exists("update") then fs.move("update", "update.old") end
+fs.move("update.new", "update")
+if readFile("update") ~= updaterSource then
+    if fs.exists("update") then fs.delete("update") end
+    if fs.exists("update.old") then fs.move("update.old", "update") end
+    error("Updater self-refresh failed; previous updater restored")
+end
+if fs.exists("update.old") then fs.delete("update.old") end
+
+local function clearEphemeral()
+    local targets={"logs","diagnostics.txt",".runtime_crash_count"}
+    for _,name in ipairs(fs.list("")) do
+        if name:match("_error%.log$") then targets[#targets+1]=name end
+    end
+    for _,name in ipairs(targets) do
         if fs.exists(name) then
-            fs.delete(name)
+            local ok,err=pcall(fs.delete,name)
+            if not ok or fs.exists(name) then
+                error("Update installed, but could not clear stale diagnostic file " .. tostring(name) .. (err and (": " .. tostring(err)) or ""))
+            end
         end
+    end
+end
 
-        fs.move(source, name)
+local function cleanReset()
+    local keep={
+        startup=true,
+        common=true,
+        prep=true,
+        push=true,
+        pushlogs=true,
+        version=true,
+        update=true,
+        [CONFIG]=true
+    }
+    keep[role == "manager" and "manager" or "foreman"]=true
+    if role=="master" then keep.world_anchor=true end
+    if role=="manager" then
+        keep["cairn_rm.cfg"]=true
+        keep.cairn_dock=true
     end
 
-    if fs.exists(STAGE) then
-        fs.delete(STAGE)
+    local failures={}
+    for _,name in ipairs(fs.list("")) do
+        local mounted=name=="rom" or name:match("^disk%d*$")
+        if not keep[name] and not mounted then
+            local ok,err=pcall(fs.delete,name)
+            if not ok or fs.exists(name) then
+                failures[#failures+1]=name .. (err and (": " .. tostring(err)) or "")
+            end
+        end
     end
-
-    if fs.exists(TEMP) then
-        fs.delete(TEMP)
+    if #failures>0 then
+        error("Update installed, but clean reset could not remove: " .. table.concat(failures, ", "))
     end
-
-    if not writeAll(VERSION_FILE, tostring(RELEASE_VERSION)) then
-        print("Installed files but could not save version record")
-        return
+    if anchor then
+        writeFile("world_anchor", textutils.serialize(anchor))
     end
+end
 
-    print("Drive2 synchronized")
-    print("Writable root was cleared before reinstalling.")
-    print("CAIRN update complete")
-    print("Installed release: v" .. RELEASE_VERSION)
-    print("Rebooting...")
+clearEphemeral()
+if not preserveState then
+    cleanReset()
+end
+
+if role == "manager" then
+    os.setComputerLabel("Regional Manager")
+else
+    os.setComputerLabel("Foreman-1")
+end
+
+print("")
+print("Update complete.")
+print("Installed version " .. version .. " for " .. roleName(role) .. ".")
+if preserveState then
+    print("The permanent updater was refreshed, runtime state was preserved, and stale logs were cleared.")
+else
+    print("The permanent updater was refreshed and the turtle was reset to a clean " .. roleName(role) .. " default.")
+end
+if autoReboot then
+    print("Rebooting into the updated release...")
     sleep(1)
     os.reboot()
 end
-
-local id = os.getComputerID()
-
-migrateLegacyFiles()
-
-if args[1] == "--apply" then
-    if id ~= MASTER_ID then
-        print("Main apply is only valid on Drive2 / 2700")
-        return
-    end
-
-    applyMain()
-
-elseif args[1] == "--apply-slave" then
-    applySlave()
-
-else
-    if id == MASTER_ID then
-        bootstrapMain()
-    elseif id == SLAVE_ID then
-        slaveBootstrap()
-    else
-        print("Unexpected computer ID: " .. id)
-        print("Expected Drive2 = 2700")
-        print("Expected Drive1 = 2701")
-    end
-end
+print("No program was launched and the turtle was not rebooted.")
+print("Run startup or reboot when you are ready to start the quarry software.")
