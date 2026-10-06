@@ -270,12 +270,12 @@ end
 
 local function cairnDockBelow()
     local okKind,kind=pcall(peripheral.getType,"bottom")
-    if not okKind or kind~="computer" then return false end
+    if not okKind then kind=nil end
     local okId,id=pcall(peripheral.call,"bottom","getID")
-    if okId and tonumber(id) then
-        return tonumber(id)==CAIRN_GATEWAY_ID
-    end
-    return true
+    id=okId and tonumber(id) or nil
+    if id==CAIRN_GATEWAY_ID then return true,kind,id end
+    if kind=="computer" or kind=="turtle" then return true,kind,id end
+    return false,kind,id
 end
 
 local function waitForCairnJob()
@@ -898,6 +898,21 @@ local function runManagerSeedBootstrap()
     end
 
     if seed.phase=="SITE_PREP" then
+        local dockedBelow=cairnDockBelow()
+        if dockedBelow then
+            local dockState=loadCairnState() or {}
+            dockState.schema=1
+            dockState.docked=true
+            dockState.dir=DIR_N
+            dockState.phase="DOCKED"
+            dockState.error=nil
+            dockState.routeIntent=nil
+            dockState.current=nil
+            if not saveCairnState(dockState) then
+                error("Could not save Cairn dock recovery state")
+            end
+            return runManagerSeedBootstrap()
+        end
         show("Clearing the quarry deployment site")
         local ok,reason=runSitePreparation()
         if not ok then error(reason or "Regional Manager could not prepare the quarry deployment site") end

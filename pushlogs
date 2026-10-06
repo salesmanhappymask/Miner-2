@@ -27,6 +27,10 @@ h.write("computer_id="..tostring(os.getComputerID()).."\n")
 h.write("label="..tostring(os.getComputerLabel() or "").."\n")
 h.write("clock="..tostring(os.clock()).."\n")
 h.write("free_space="..tostring(fs.getFreeSpace("")).."\n")
+local bottomKind=peripheral.getType("bottom")
+local okBottomId,bottomId=pcall(peripheral.call,"bottom","getID")
+h.write("bottom_peripheral_type="..tostring(bottomKind or "none").."\n")
+h.write("bottom_peripheral_id="..tostring(okBottomId and bottomId or "unavailable").."\n")
 local root=fs.list("")
 table.sort(root)
 local entries={}
@@ -34,7 +38,7 @@ for _,name in ipairs(root) do
     if not fs.isDir(name) then entries[#entries+1]=name..":"..tostring(fs.getSize(name)) end
 end
 h.write("root_files="..table.concat(entries,",").."\n")
-local stateFiles={"version","updater.cfg","node.cfg","world_anchor","manager_seed.cfg","manager_seed.cfg.bak","regional_manager.tmp","regional_manager.tmp.bak","foreman1.tmp","foreman2.tmp","foreman3.tmp","foreman4.tmp","miner.tmp","navigator.tmp"}
+local stateFiles={"version","updater.cfg","node.cfg","world_anchor","cairn_rm.cfg","cairn_rm.cfg.bak","manager_seed.cfg","manager_seed.cfg.bak","regional_manager.tmp","regional_manager.tmp.bak","foreman1.tmp","foreman2.tmp","foreman3.tmp","foreman4.tmp","miner.tmp","navigator.tmp"}
 for _,path in ipairs(stateFiles) do
     if fs.exists(path) and not fs.isDir(path) then append(h,path,readFile(path)) end
 end
