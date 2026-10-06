@@ -270,24 +270,37 @@ end
 
 local function cairnDockBelow()
     local okKind,kind=pcall(peripheral.getType,"bottom")
+    if not okKind or kind~="computer" then return false end
     local okId,id=pcall(peripheral.call,"bottom","getID")
-    return okKind and kind~=nil and okId and tonumber(id)==CAIRN_GATEWAY_ID
+    if okId and tonumber(id) then
+        return tonumber(id)==CAIRN_GATEWAY_ID
+    end
+    return true
 end
 
 local function waitForCairnJob()
     local state=loadCairnState()
-    if not state then
-        if not cairnDockBelow() then return nil end
-        state={
-            schema=1,
-            docked=true,
-            phase="DOCKED",
-            dir=DIR_N
-        }
+    local physicallyDocked=cairnDockBelow()
+
+    if physicallyDocked then
+        local recovered=type(state)~="table" or state.docked~=true
+        state=type(state)=="table" and state or {}
+        state.docked=true
+        state.schema=1
+        state.dir=DIR_N
+        if recovered then
+            state.phase="DOCKED"
+            state.error=nil
+            state.routeIntent=nil
+            state.current=nil
+            if fs.exists("manager_seed.cfg") then
+                pcall(fs.delete,"manager_seed.cfg")
+            end
+        end
         if not saveCairnState(state) then
             error("Could not create Cairn dock state")
         end
-    elseif state.docked~=true then
+    elseif not state or state.docked~=true then
         return state
     end
 
@@ -368,12 +381,23 @@ local function waitForCairnJob()
                 end
 
             elseif message.type=="quarry_status_query" and state.job then
-                cairnSend({
-                    type="quarry_status",
-                    jobToken=state.job.jobToken,
-                    phase=state.phase or "DOCKED",
-                    error=state.error
-                })
+                if state.phase=="DOCKED" and cairnDockBelow() and
+                    tostring(message.jobToken or "")==tostring(state.job.jobToken or "") then
+                    state.phase="READY"
+                    saveCairnState(state)
+                    cairnSend({
+                        type="quarry_ready",
+                        jobToken=state.job.jobToken,
+                        phase="READY"
+                    })
+                else
+                    cairnSend({
+                        type="quarry_status",
+                        jobToken=state.job.jobToken,
+                        phase=state.phase or "DOCKED",
+                        error=state.error
+                    })
+                end
             end
         end
     end
