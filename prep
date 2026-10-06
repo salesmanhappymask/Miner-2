@@ -1,0 +1,148 @@
+local RAW="https://raw.githubusercontent.com/salesmanhappymask/Miner/main/"
+local args={...}
+
+local function fetch(name)
+    local response=http.get(RAW..name)
+    if not response then error("Could not download "..name) end
+    local data=response.readAll()
+    response.close()
+    if not data or data=="" then error("Empty download: "..name) end
+    data=tostring(data):gsub("\r\n","\n"):gsub("\r","\n"):gsub("\n+$","")
+    return data
+end
+
+local function write(path,data)
+    local file=fs.open(path,"w")
+    if not file then error("Could not write "..path) end
+    file.write(data)
+    file.close()
+    local check=fs.open(path,"r")
+    if not check then error("Could not verify "..path) end
+    local actual=check.readAll()
+    check.close()
+    if actual~=data then
+        error("Disk verification failed: "..path.."; free "..
+            tostring(fs.getFreeSpace and fs.getFreeSpace("disk") or "unknown").." bytes")
+    end
+end
+
+local side
+if peripheral.getType("top")=="drive" then
+    side="top"
+elseif peripheral.getType("bottom")=="drive" then
+    side="bottom"
+else
+    error("Disk Drive must be directly above or below the turtle")
+end
+
+local mode=tostring(args[1] or "")
+if mode~="1" and mode~="2" then
+    print("1. Initial Setup: Master Foreman setup")
+    print("2. Standard: worker installation")
+    mode=read()
+end
+if mode~="1" and mode~="2" then error("Select 1 or 2") end
+
+local limit=tonumber(args[2])
+if limit then
+    limit=math.floor(limit)
+    if limit<1 then error("Disk count must be at least 1") end
+end
+
+local function fetchInstallerSnapshot(selectedMode)
+    local lastVersion=nil
+    local lastDeclared=nil
+    for attempt=1,6 do
+        local before=fetch("version"):match("^%s*(%d+)%s*$")
+        if before then
+            local startupName=selectedMode=="1" and "master_setup_startup" or "worker_disk_startup"
+            local startupSource=fetch(startupName)
+            local updateSource=selectedMode=="1" and fetch("update") or nil
+            local declared
+            if selectedMode=="1" then
+                declared=startupSource:match("local%s+VERSION%s*=%s*(%d+)")
+            else
+                declared=startupSource:match("local%s+EXPECTED_VERSION%s*=%s*(%d+)")
+            end
+            local after=fetch("version"):match("^%s*(%d+)%s*$")
+            lastVersion=after or before
+            lastDeclared=declared
+            if before==after and declared==before then
+                return before,startupSource,updateSource
+            end
+        end
+        if attempt<6 then sleep(1) end
+    end
+    local kind=selectedMode=="1" and "Master setup" or "Worker installer"
+    error(kind.."/version mismatch after 6 checks; version="..tostring(lastVersion)..", installer="..tostring(lastDeclared))
+end
+
+local contents={}
+local label
+local releaseVersion,startupSource,updateSource=fetchInstallerSnapshot(mode)
+contents.startup=startupSource
+if mode=="1" then
+    contents.update=updateSource
+    label=tostring(args[3] or "setup")
+else
+    label=tostring(args[3] or "quarry worker")
+end
+
+local compile=loadstring or load
+if compile then
+    for name,data in pairs(contents) do
+        if not compile(data,name) then error("Invalid downloaded "..name) end
+    end
+end
+
+local slots={}
+local slotSpec=tostring(args[4] or "")
+if slotSpec~="" then
+    for token in string.gmatch(slotSpec,"[^,]+") do
+        local slot=tonumber(token)
+        if not slot or slot<1 or slot>16 or slot~=math.floor(slot) then
+            error("Invalid disk slot list: "..slotSpec)
+        end
+        slots[#slots+1]=slot
+    end
+    if #slots==0 then error("Disk slot list is empty") end
+else
+    for slot=1,16 do slots[#slots+1]=slot end
+end
+
+local prepared=0
+for _,slot in ipairs(slots) do
+    if not limit or prepared<limit then
+        if turtle.getItemCount(slot)>0 then
+            turtle.select(slot)
+            local inserted=side=="top" and turtle.dropUp(1) or turtle.dropDown(1)
+            if inserted then
+                sleep(0.2)
+                if not fs.exists("disk") or not fs.isDir("disk") then
+                    local returned=side=="top" and turtle.suckUp(1) or turtle.suckDown(1)
+                    if not returned then error("Inserted item was not a writable disk and could not be recovered") end
+                else
+                    for _,name in ipairs(fs.list("disk")) do
+                        fs.delete(fs.combine("disk",name))
+                    end
+                    local bytes=0
+                    for _,data in pairs(contents) do bytes=bytes+#data end
+                    if fs.getFreeSpace and fs.getFreeSpace("disk")<bytes then
+                        error("Disk needs "..bytes.." bytes; has "..fs.getFreeSpace("disk"))
+                    end
+                    for name,data in pairs(contents) do
+                        write("disk/"..name,data)
+                    end
+                    disk.setLabel(side,label)
+                    local returned=side=="top" and turtle.suckUp(1) or turtle.suckDown(1)
+                    if not returned then error("Could not retrieve prepared disk") end
+                    prepared=prepared+1
+                end
+            end
+        end
+    end
+end
+if limit and prepared~=limit then
+    error("Prepared "..tostring(prepared).." disks, expected "..tostring(limit))
+end
+print("Prepared "..tostring(prepared).." "..(mode=="1" and "setup" or "worker").." disks")
