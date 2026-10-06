@@ -268,9 +268,28 @@ local function cairnRunUndock(state)
     return true
 end
 
+local function cairnDockBelow()
+    local okKind,kind=pcall(peripheral.getType,"bottom")
+    local okId,id=pcall(peripheral.call,"bottom","getID")
+    return okKind and kind~=nil and okId and tonumber(id)==CAIRN_GATEWAY_ID
+end
+
 local function waitForCairnJob()
     local state=loadCairnState()
-    if not state or state.docked~=true then return state end
+    if not state then
+        if not cairnDockBelow() then return nil end
+        state={
+            schema=1,
+            docked=true,
+            phase="DOCKED",
+            dir=DIR_N
+        }
+        if not saveCairnState(state) then
+            error("Could not create Cairn dock state")
+        end
+    elseif state.docked~=true then
+        return state
+    end
 
     while not openRegionalManagerNetwork() do
         term.clear()
@@ -290,7 +309,8 @@ local function waitForCairnJob()
         print("Cairn dock mode")
         print("")
         print("Facing north")
-        print("Waiting for quarry job from Drive1 / 2701")
+        print("Waiting for Cairn to reach quarry destination")
+        print("Drive1 / 2701 will launch the quarry when ready")
         print("")
         if state.phase then print("State: "..tostring(state.phase)) end
 

@@ -1,4 +1,4 @@
-local RAW="https://raw.githubusercontent.com/salesmanhappymask/Miner/main/"
+local RAW="https://raw.githubusercontent.com/salesmanhappymask/Miner-2/main/"
 local args={...}
 
 local function fetch(name)

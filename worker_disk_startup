@@ -1,5 +1,5 @@
-local EXPECTED_VERSION = 162
-local RAW = "https://raw.githubusercontent.com/salesmanhappymask/Miner/main/"
+local EXPECTED_VERSION = 163
+local RAW = "https://raw.githubusercontent.com/salesmanhappymask/Miner-2/main/"
 
 if fs.exists("node.cfg") then
     if not fs.exists("/startup") then
