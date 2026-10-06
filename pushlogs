@@ -1,54 +1,182 @@
-local out="diagnostics.txt"
+local CAIRN_RELEASE = 33
+
+local MASTER_ID = 2700
+local SLAVE_ID = 2701
+local LINK_PROTOCOL = "cairn.drive.link"
+local OUT = "diagnostics.txt"
+local SIDES = {"top", "bottom", "left", "right", "front", "back"}
+
 local function readFile(path)
-    local h=fs.open(path,"r")
-    if not h then return nil end
-    local data=h.readAll() or ""
+    if not fs.exists(path) or fs.isDir(path) then
+        return nil
+    end
+    local h = fs.open(path, "r")
+    if not h then
+        return nil
+    end
+    local data = h.readAll() or ""
     h.close()
     return data
 end
-local function tail(path,limit)
-    local data=readFile(path) or ""
-    if #data>limit then data=data:sub(#data-limit+1) end
+
+local function tail(path, limit)
+    local data = readFile(path) or ""
+    if #data > limit then
+        data = string.sub(data, #data - limit + 1)
+    end
     return data
 end
-local function append(h,title,body)
-    h.write("\n===== "..title.." =====\n")
+
+local function append(h, title, body)
+    h.write("\n===== " .. title .. " =====\n")
     h.write(body or "<missing>")
     h.write("\n")
 end
-if debugFlush then pcall(debugFlush) end
-sleep(0.5)
-if fs.exists(out) then fs.delete(out) end
-local h=fs.open(out,"w")
-if not h then error("Cannot create diagnostics.txt") end
-h.write("QUARRY SWARM DIAGNOSTIC BUNDLE\n")
-h.write("version="..tostring(VERSION or readFile("version") or "unknown").."\n")
-h.write("computer_id="..tostring(os.getComputerID()).."\n")
-h.write("label="..tostring(os.getComputerLabel() or "").."\n")
-h.write("clock="..tostring(os.clock()).."\n")
-h.write("free_space="..tostring(fs.getFreeSpace("")).."\n")
-local bottomKind=peripheral.getType("bottom")
-local okBottomId,bottomId=pcall(peripheral.call,"bottom","getID")
-h.write("bottom_peripheral_type="..tostring(bottomKind or "none").."\n")
-h.write("bottom_peripheral_id="..tostring(okBottomId and bottomId or "unavailable").."\n")
-local root=fs.list("")
+
+local function peripheralSummary()
+    local rows = {}
+    for _, side in ipairs(SIDES) do
+        local kind = peripheral.getType(side)
+        local wireless = ""
+        if kind == "modem" then
+            local ok, value = pcall(peripheral.call, side, "isWireless")
+            if ok then
+                wireless = value and ":wireless" or ":wired"
+            end
+        end
+        rows[#rows + 1] = side .. "=" .. tostring(kind or "none") .. wireless
+    end
+    return table.concat(rows, ",")
+end
+
+local function redstoneSummary()
+    local rows = {}
+    for _, side in ipairs(SIDES) do
+        rows[#rows + 1] =
+            side .. "=" ..
+            tostring(redstone.getOutput(side)) ..
+            "/" .. tostring(redstone.getInput(side))
+    end
+    return table.concat(rows, ",")
+end
+
+local function openWired(side)
+    if peripheral.getType(side) ~= "modem" then
+        return false
+    end
+    local ok, wireless = pcall(peripheral.call, side, "isWireless")
+    if not ok or wireless ~= false then
+        return false
+    end
+    if not rednet.isOpen(side) then
+        rednet.open(side)
+    end
+    return true
+end
+
+local function querySlave()
+    if os.getComputerID() ~= MASTER_ID then
+        return nil, "not Drive2"
+    end
+    if not openWired("left") then
+        return nil, "Drive2 left wired modem unavailable"
+    end
+    local token =
+        "diag:" .. tostring(os.getComputerID()) .. ":" ..
+        tostring(math.floor(os.clock() * 1000))
+    rednet.send(SLAVE_ID, {
+        type = "diag_request",
+        token = token
+    }, LINK_PROTOCOL)
+    local deadline = os.clock() + 1.5
+    while os.clock() < deadline do
+        local sender, message, protocol = rednet.receive(
+            LINK_PROTOCOL,
+            deadline - os.clock()
+        )
+        if not sender then
+            break
+        end
+        if
+            sender == SLAVE_ID and
+            type(message) == "table" and
+            message.type == "diag_reply" and
+            message.token == token
+        then
+            return message
+        end
+    end
+    return nil, "Drive1 diagnostic request timed out"
+end
+
+if fs.exists(OUT) then
+    fs.delete(OUT)
+end
+
+local h = fs.open(OUT, "w")
+if not h then
+    error("Cannot create diagnostics.txt")
+end
+
+h.write("CAIRN DIAGNOSTIC BUNDLE\n")
+h.write("release=" .. tostring(CAIRN_RELEASE) .. "\n")
+h.write("computer_id=" .. tostring(os.getComputerID()) .. "\n")
+h.write("label=" .. tostring(os.getComputerLabel() or "") .. "\n")
+h.write("clock=" .. tostring(os.clock()) .. "\n")
+h.write("free_space=" .. tostring(fs.getFreeSpace("")) .. "\n")
+h.write("peripherals=" .. peripheralSummary() .. "\n")
+h.write("redstone_output_input=" .. redstoneSummary() .. "\n")
+
+local root = fs.list("")
 table.sort(root)
-local entries={}
-for _,name in ipairs(root) do
-    if not fs.isDir(name) then entries[#entries+1]=name..":"..tostring(fs.getSize(name)) end
+local entries = {}
+for _, name in ipairs(root) do
+    if not fs.isDir(name) then
+        entries[#entries + 1] = name .. ":" .. tostring(fs.getSize(name))
+    end
 end
-h.write("root_files="..table.concat(entries,",").."\n")
-local stateFiles={"version","updater.cfg","node.cfg","world_anchor","cairn_rm.cfg","cairn_rm.cfg.bak","manager_seed.cfg","manager_seed.cfg.bak","regional_manager.tmp","regional_manager.tmp.bak","foreman1.tmp","foreman2.tmp","foreman3.tmp","foreman4.tmp","miner.tmp","navigator.tmp"}
-for _,path in ipairs(stateFiles) do
-    if fs.exists(path) and not fs.isDir(path) then append(h,path,readFile(path)) end
+h.write("root_files=" .. table.concat(entries, ",") .. "\n")
+
+local stateFiles = {
+    "cairn_version",
+    ".cairn_version",
+    "cairn_drive_state",
+    "cairn_drive1_state",
+    ".cairn_drive.tmp",
+    ".cairn_drive1.tmp"
+}
+for _, path in ipairs(stateFiles) do
+    if fs.exists(path) and not fs.isDir(path) then
+        append(h, path, readFile(path))
+    end
 end
-if fs.exists("logs/current.log") then append(h,"logs/current.log.tail",tail("logs/current.log",32768)) end
-if fs.exists("logs/errors.log") then append(h,"logs/errors.log.tail",tail("logs/errors.log",16384)) end
+
+if fs.exists("logs/current.log") then
+    append(h, "logs/current.log.tail", tail("logs/current.log", 32768))
+end
+if fs.exists("logs/previous.log") then
+    append(h, "logs/previous.log.tail", tail("logs/previous.log", 16384))
+end
+if fs.exists("logs/errors.log") then
+    append(h, "logs/errors.log.tail", tail("logs/errors.log", 16384))
+end
+
+local slave, slaveError = querySlave()
+if slave then
+    append(h, "drive1.live_state", textutils.serialize(slave.state or {}))
+    append(h, "drive1.live_peripherals", textutils.serialize(slave.peripherals or {}))
+    append(h, "drive1.live_outputs", textutils.serialize(slave.outputs or {}))
+else
+    append(h, "drive1.live_probe", tostring(slaveError or "unavailable"))
+end
+
 h.close()
-print("Diagnostic bundle created: "..out)
+print("Cairn diagnostic bundle created: " .. OUT)
 if fs.exists("push") then
-    local ok=shell.run("push",out)
-    if ok and fs.exists(out) then fs.delete(out) end
+    local ok = shell.run("push", OUT)
+    if ok and fs.exists(OUT) then
+        fs.delete(OUT)
+    end
 else
     print("push is not installed; upload diagnostics.txt manually")
 end

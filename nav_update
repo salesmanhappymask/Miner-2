@@ -1,0 +1,135 @@
+local RELEASE_VERSION = 33
+local BASE_URL = "https://raw.githubusercontent.com/salesmanhappymask/Cairn/main/"
+local FILES = {"startup", "nav_control", "nav_update"}
+
+local function readAll(path)
+    if not fs.exists(path) then
+        return nil
+    end
+
+    local h = fs.open(path, "r")
+
+    if not h then
+        return nil
+    end
+
+    local data = h.readAll()
+    h.close()
+    return data
+end
+
+local function writeAll(path, data)
+    local h = fs.open(path, "w")
+
+    if not h then
+        return false
+    end
+
+    h.write(data)
+    h.close()
+    return readAll(path) == data
+end
+
+local function fetch(name)
+    if not http or not http.get then
+        return nil, "HTTP API unavailable"
+    end
+
+    local ok, handle, err = pcall(
+        http.get,
+        BASE_URL .. name .. "?nav=" .. tostring(math.floor(os.clock() * 1000))
+    )
+
+    if not ok then
+        return nil, tostring(handle)
+    end
+
+    if not handle then
+        return nil, tostring(err or "HTTP request failed")
+    end
+
+    local data = handle.readAll()
+    handle.close()
+
+    if not data or data == "" then
+        return nil, "Empty response for " .. name
+    end
+
+    return data
+end
+
+local function releaseOf(name, data)
+    local pattern = name == "nav_update"
+        and "local%s+RELEASE_VERSION%s*=%s*(%d+)"
+        or "local%s+CAIRN_RELEASE%s*=%s*(%d+)"
+    return tonumber(string.match(data, pattern))
+end
+
+if os.getComputerID() ~= 2705 then
+    print("CAIRN NAV updater")
+    print("Reserved for controller 2705.")
+    print("Current ID: " .. os.getComputerID())
+    return
+end
+
+print("CAIRN NAV updater")
+print("Target release: v" .. RELEASE_VERSION)
+print("")
+
+local downloaded = {}
+
+for _, name in ipairs(FILES) do
+    print("Downloading " .. name)
+    local data, err = fetch(name)
+
+    if not data then
+        error("Download failed: " .. tostring(err))
+    end
+
+    local release = releaseOf(name, data)
+
+    if release ~= RELEASE_VERSION then
+        error(
+            name .. " is v" .. tostring(release) ..
+            ", expected v" .. tostring(RELEASE_VERSION)
+        )
+    end
+
+    local fn, syntaxErr = (loadstring or load)(data, name)
+
+    if not fn then
+        error("Invalid " .. name .. ": " .. tostring(syntaxErr))
+    end
+
+    downloaded[name] = data
+end
+
+local rootDrive = fs.getDrive("")
+
+for _, name in ipairs(fs.list("")) do
+    local okDrive, drive = pcall(fs.getDrive, name)
+    local writable = okDrive and drive == rootDrive and not fs.isReadOnly(name)
+
+    if writable then
+        local ok, err = pcall(fs.delete, name)
+
+        if not ok or fs.exists(name) then
+            error("Could not clear " .. name .. ": " .. tostring(err or "delete failed"))
+        end
+    end
+end
+
+for _, name in ipairs(FILES) do
+    if not writeAll(name, downloaded[name]) then
+        error("Could not install " .. name)
+    end
+end
+
+
+os.setComputerLabel("Cairn Nav")
+print("")
+print("Controller update complete.")
+print("All writable files were cleared before reinstalling from the Cairn repository.")
+print("Rebooting...")
+sleep(1)
+os.reboot()

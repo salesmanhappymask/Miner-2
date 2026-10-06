@@ -1,0 +1,873 @@
+local CAIRN_RELEASE = 33
+
+local CONTROL_ID = 2705
+local SLAVE_ID = 2701
+
+local CONTROL_PROTOCOL = "cairn.nav.command"
+local CONTROL_REPLY_PROTOCOL = "cairn.nav.reply"
+local CONFIG_FILE = "nav_control.cfg"
+
+local COMMAND_SENDS = 28
+local COMMAND_INTERVAL = 0.075
+local STATUS_SENDS = 10
+local STATUS_INTERVAL = 0.060
+
+local SIDES = {
+    "top",
+    "bottom",
+    "left",
+    "right",
+    "front",
+    "back"
+}
+
+local sequence = 0
+local activity = "Ready"
+local detail = ""
+local lastStatus = nil
+local buttons = {}
+
+local function readConfig()
+    if not fs.exists(CONFIG_FILE) then
+        return {}
+    end
+
+    local h = fs.open(CONFIG_FILE, "r")
+
+    if not h then
+        return {}
+    end
+
+    local raw = h.readAll()
+    h.close()
+
+    local ok, value = pcall(textutils.unserialize, raw)
+
+    if not ok or type(value) ~= "table" then
+        return {}
+    end
+
+    return value
+end
+
+local function writeConfig(value)
+    local h = fs.open(CONFIG_FILE, "w")
+
+    if not h then
+        return false
+    end
+
+    h.write(textutils.serialize(value))
+    h.close()
+    return true
+end
+
+local config = readConfig()
+
+local function gridText()
+    if
+        type(config.gridSouthWest) == "table" and
+        type(config.gridSouthWest.x) == "number" and
+        type(config.gridSouthWest.z) == "number"
+    then
+        return tostring(config.gridSouthWest.x) .. "," .. tostring(config.gridSouthWest.z)
+    end
+
+    return "unset"
+end
+
+local function setBackground(value)
+    local fn = term.setBackgroundColor or term.setBackgroundColour
+
+    if fn then
+        fn(value)
+    end
+end
+
+local function setText(value)
+    local fn = term.setTextColor or term.setTextColour
+
+    if fn then
+        fn(value)
+    end
+end
+
+local function resetColors()
+    setBackground(colors.black)
+    setText(colors.white)
+end
+
+local function findWireless()
+    for _, side in ipairs(SIDES) do
+        if peripheral.getType(side) == "modem" then
+            local ok, wireless = pcall(
+                peripheral.call,
+                side,
+                "isWireless"
+            )
+
+            if ok and wireless == true then
+                return side
+            end
+        end
+    end
+
+    return nil
+end
+
+local function openWireless()
+    local side = findWireless()
+
+    if not side then
+        return nil
+    end
+
+    if not rednet.isOpen(side) then
+        rednet.open(side)
+    end
+
+    return side
+end
+
+local function nextToken()
+    sequence = sequence + 1
+
+    return
+        tostring(CONTROL_ID) ..
+        ":" ..
+        tostring(sequence) ..
+        ":" ..
+        tostring(math.floor(os.clock() * 1000))
+end
+
+local function trim(value, width)
+    value = tostring(value or "")
+
+    if #value <= width then
+        return value
+    end
+
+    if width <= 3 then
+        return string.sub(value, 1, width)
+    end
+
+    return string.sub(value, 1, width - 3) .. "..."
+end
+
+local function line(y, value)
+    local width = term.getSize()
+
+    term.setCursorPos(1, y)
+    term.clearLine()
+    write(trim(value, width))
+end
+
+local function position(value)
+    if type(value) ~= "table" then
+        return "unknown"
+    end
+
+    return
+        tostring(value.x) ..
+        "," ..
+        tostring(value.y) ..
+        "," ..
+        tostring(value.z)
+end
+
+local function drawActivity()
+    local _, height = term.getSize()
+
+    line(height - 1, "ACTION: " .. activity)
+    line(height, "LINK: " .. detail)
+end
+
+local function setActivity(value, extra)
+    activity = value
+
+    if extra ~= nil then
+        detail = extra
+    end
+
+    drawActivity()
+end
+
+local function addButton(id, label, x1, y1, x2, y2, background)
+    buttons[#buttons + 1] = {
+        id = id,
+        x1 = x1,
+        y1 = y1,
+        x2 = x2,
+        y2 = y2
+    }
+
+    setBackground(background)
+    setText(colors.white)
+
+    for y = y1, y2 do
+        term.setCursorPos(x1, y)
+        write(string.rep(" ", x2 - x1 + 1))
+    end
+
+    local width = x2 - x1 + 1
+    local text = trim(label, width - 2)
+    local tx = x1 + math.floor((width - #text) / 2)
+    local ty = y1 + math.floor((y2 - y1) / 2)
+
+    term.setCursorPos(tx, ty)
+    write(text)
+
+    resetColors()
+end
+
+local function drawButtons()
+    buttons = {}
+
+    local width, height = term.getSize()
+
+    if height < 18 then
+        return
+    end
+
+    local gap = 1
+    local leftWidth = math.floor((width - gap) / 2)
+    local rightX = leftWidth + gap + 1
+
+    addButton("destination", "DESTINATION", 1, 7, leftWidth, 8, colors.blue)
+    addButton("quarry", "QUARRY", rightX, 7, width, 8, colors.lime)
+    addButton("pause", "PAUSE", 1, 9, leftWidth, 10, colors.orange)
+    addButton("resume", "RESUME", rightX, 9, width, 10, colors.green)
+    addButton("cancel", "CANCEL", 1, 11, leftWidth, 12, colors.red)
+    addButton("return", "RETURN", rightX, 11, width, 12, colors.purple)
+    addButton("position", "SET POSITION", 1, 13, leftWidth, 14, colors.cyan)
+    addButton("chunk", "CHUNK GRID", rightX, 13, width, 14, colors.cyan)
+    addButton("update", "UPDATE CAIRN", 1, 15, leftWidth, 16, colors.brown)
+    addButton("refresh", "REFRESH", rightX, 15, width, 16, colors.gray)
+
+    if height >= 20 then
+        addButton("navupdate", "UPDATE NAV", 1, 17, width, 18, colors.lightBlue)
+    end
+end
+
+local function draw()
+    resetColors()
+    term.clear()
+    term.setCursorPos(1, 1)
+
+    print("CAIRN NAV 2705")
+
+    if lastStatus then
+        print(
+            "Platform v" ..
+            tostring(lastStatus.release or "?") ..
+            "  Relay OK"
+        )
+
+        print(
+            "POS " ..
+            position(lastStatus.current) ..
+            "  CRZ " ..
+            tostring(lastStatus.cruise or "?")
+        )
+
+        print(
+            "DST " ..
+            position(lastStatus.destination)
+        )
+
+        print(
+            "STG " ..
+            tostring(lastStatus.stage or "idle") ..
+            "  " ..
+            (lastStatus.paused and "PAUSED" or "RUNNING")
+        )
+
+        local tail = "MOVE none"
+
+        if lastStatus.quarry then
+            tail =
+                "QRY " ..
+                tostring(lastStatus.quarry.phase or "?") ..
+                (lastStatus.quarry.error and
+                    (" " .. tostring(lastStatus.quarry.error)) or
+                    "")
+        elseif lastStatus.transaction then
+            tail =
+                "MOVE " ..
+                tostring(lastStatus.transaction.direction) ..
+                " " ..
+                tostring(lastStatus.transaction.phase)
+        end
+
+        print("GRID " .. gridText() .. "  " .. tail)
+    else
+        print("Platform status unavailable")
+        print("POS unknown")
+        print("DST unknown")
+        print("STG unknown")
+        print("GRID " .. gridText() .. "  MOVE unknown")
+    end
+
+    drawButtons()
+    drawActivity()
+end
+
+local function request(payload, label, sends, interval)
+    local token = nextToken()
+
+    payload.token = token
+
+    local relaySeen = false
+
+    for attempt = 1, sends do
+        setActivity(
+            "Broadcasting " .. label,
+            tostring(attempt) .. "/" .. tostring(sends)
+        )
+
+        rednet.broadcast(
+            payload,
+            CONTROL_PROTOCOL
+        )
+
+        local deadline = os.clock() + interval
+
+        while os.clock() < deadline do
+            local sender, message = rednet.receive(
+                CONTROL_REPLY_PROTOCOL,
+                deadline - os.clock()
+            )
+
+            if not sender then
+                break
+            end
+
+            if
+                sender == SLAVE_ID and
+                type(message) == "table" and
+                message.token == token
+            then
+                if message.type == "relay_ack" then
+                    relaySeen = true
+
+                    setActivity(
+                        "Drive1 heard " .. label,
+                        "Relaying to Drive2"
+                    )
+
+                else
+                    setActivity(
+                        message.ok == false
+                            and "Command rejected"
+                            or label .. " acknowledged",
+                        message.message or "Drive2 replied"
+                    )
+
+                    return message
+                end
+            end
+        end
+    end
+
+    if relaySeen then
+        setActivity(
+            label .. " reached Drive1",
+            "No Drive2 reply yet"
+        )
+    else
+        setActivity(
+            label .. " not received",
+            "No reply from Drive1"
+        )
+    end
+
+    return nil
+end
+
+local function requestCommand(payload, label)
+    return request(
+        payload,
+        label,
+        COMMAND_SENDS,
+        COMMAND_INTERVAL
+    )
+end
+
+local function requestStatus()
+    return request(
+        {
+            command = "status"
+        },
+        "STATUS",
+        STATUS_SENDS,
+        STATUS_INTERVAL
+    )
+end
+
+local function refreshStatus()
+    local reply = requestStatus()
+
+    if reply and reply.type == "status" then
+        lastStatus = reply
+    end
+
+    draw()
+end
+
+local function askInteger(label)
+    while true do
+        write(label .. ": ")
+
+        local raw = read()
+        local value = tonumber(raw)
+
+        if value and value == math.floor(value) then
+            return value
+        end
+
+        print("Whole number required.")
+    end
+end
+
+local function destination()
+    resetColors()
+    term.clear()
+    term.setCursorPos(1, 1)
+
+    print("SET ONE-WAY DESTINATION")
+    print("")
+    print(
+        "Current: " ..
+        position(lastStatus and lastStatus.current)
+    )
+    print("")
+
+    local x = askInteger("X")
+    local y = askInteger("Y")
+    local z = askInteger("Z")
+    local cruise = askInteger("Cruise Y")
+
+    return requestCommand(
+        {
+            command = "set_destination",
+            x = x,
+            y = y,
+            z = z,
+            cruise = cruise
+        },
+        "DESTINATION"
+    )
+end
+
+local function quarry()
+    resetColors()
+    term.clear()
+    term.setCursorPos(1, 1)
+
+    print("SET QUARRY DESTINATION")
+    print("")
+    print(
+        "Current: " ..
+        position(lastStatus and lastStatus.current)
+    )
+    print("Chunk grid SW: " .. gridText())
+    print("")
+
+    if
+        type(config.gridSouthWest) ~= "table" or
+        type(config.gridSouthWest.x) ~= "number" or
+        type(config.gridSouthWest.z) ~= "number"
+    then
+        print("Set CHUNK GRID before starting Quarry.")
+        print("Press Enter to return.")
+        read()
+        return nil
+    end
+
+    local x = askInteger("X")
+    local y = askInteger("Y")
+    local z = askInteger("Z")
+    local cruise = askInteger("Cruise Y")
+
+    return requestCommand(
+        {
+            command = "quarry",
+            x = x,
+            y = y,
+            z = z,
+            cruise = cruise,
+            gridX = config.gridSouthWest.x,
+            gridZ = config.gridSouthWest.z
+        },
+        "QUARRY"
+    )
+end
+
+local function setChunkGrid()
+    resetColors()
+    term.clear()
+    term.setCursorPos(1, 1)
+
+    print("SET CHUNK GRID")
+    print("")
+    print("Enter the southwest corner of the chunk")
+    print("that currently contains Drive2.")
+    print("")
+
+    local x = askInteger("Southwest X")
+    local z = askInteger("Southwest Z")
+
+    if lastStatus and type(lastStatus.current) == "table" then
+        local offsetX = lastStatus.current.x - x
+        local offsetZ = z - lastStatus.current.z
+
+        if offsetX < 0 or offsetX >= 16 or offsetZ < 0 or offsetZ >= 16 then
+            print("")
+            print("That is not the southwest corner of")
+            print("Drive2's current 16x16 chunk.")
+            print("Press Enter to return.")
+            read()
+            return nil
+        end
+    end
+
+    config.gridSouthWest = {x = x, z = z}
+
+    if not writeConfig(config) then
+        setActivity("Chunk grid failed", "Could not save nav_control.cfg")
+        return nil
+    end
+
+    setActivity("Chunk grid saved", tostring(x) .. "," .. tostring(z))
+    return true
+end
+
+local function setPosition()
+    resetColors()
+    term.clear()
+    term.setCursorPos(1, 1)
+
+    print("SET CURRENT POSITION")
+    print("")
+    print("Only use at the platform's actual location.")
+    print("")
+
+    local x = askInteger("X")
+    local y = askInteger("Y")
+    local z = askInteger("Z")
+
+    return requestCommand(
+        {
+            command = "set_position",
+            x = x,
+            y = y,
+            z = z
+        },
+        "POSITION"
+    )
+end
+
+local function returnOrigin()
+    resetColors()
+    term.clear()
+    term.setCursorPos(1, 1)
+
+    print("RETURN TO ORIGIN")
+    print("")
+
+    if lastStatus and lastStatus.origin then
+        print(
+            "Origin: " ..
+            position(lastStatus.origin)
+        )
+    end
+
+    print("")
+
+    local cruise = askInteger("Cruise Y")
+
+    return requestCommand(
+        {
+            command = "return_origin",
+            cruise = cruise
+        },
+        "RETURN"
+    )
+end
+
+local function updatePlatform()
+    resetColors()
+    term.clear()
+    term.setCursorPos(1, 1)
+
+    print("FORCE PLATFORM UPDATE")
+    print("")
+    print("Drive1 relays this to Drive2.")
+    print("Drive2 updates Drive1, then itself.")
+    print("")
+    print("Type YES to continue.")
+
+    local answer = string.upper(read() or "")
+
+    if answer ~= "YES" then
+        setActivity(
+            "Update cancelled",
+            "No changes made"
+        )
+        return nil
+    end
+
+    return requestCommand(
+        {
+            command = "force_update"
+        },
+        "UPDATE"
+    )
+end
+
+local function updateController()
+    resetColors()
+    term.clear()
+    term.setCursorPos(1, 1)
+
+    print("UPDATE HANDHELD NAV")
+    print("")
+    print("This clears all writable files")
+    print("and reinstalls from the Cairn repo.")
+    print("Chunk-grid calibration will be cleared.")
+    print("")
+    print("Type YES to continue.")
+
+    local answer = string.upper(read() or "")
+
+    if answer ~= "YES" then
+        setActivity("Nav update cancelled", "No changes made")
+        return nil
+    end
+
+    if not fs.exists("nav_update") then
+        setActivity("Nav update unavailable", "Install nav_update once")
+        return nil
+    end
+
+    local ok = shell.run("nav_update")
+
+    if not ok then
+        setActivity("Nav update failed", "Run nav_update from shell")
+    end
+
+    return nil
+end
+
+local function handle(id)
+    local reply = nil
+
+    if id == "destination" then
+        setActivity(
+            "Destination selected",
+            "Entering coordinates"
+        )
+        reply = destination()
+
+    elseif id == "quarry" then
+        setActivity(
+            "Quarry selected",
+            "Entering destination"
+        )
+        reply = quarry()
+
+    elseif id == "pause" then
+        setActivity(
+            "Pause selected",
+            "Broadcast starting"
+        )
+        reply = requestCommand(
+            {
+                command = "pause"
+            },
+            "PAUSE"
+        )
+
+    elseif id == "resume" then
+        setActivity(
+            "Resume selected",
+            "Broadcast starting"
+        )
+        reply = requestCommand(
+            {
+                command = "resume"
+            },
+            "RESUME"
+        )
+
+    elseif id == "cancel" then
+        setActivity(
+            "Cancel selected",
+            "Broadcast starting"
+        )
+        reply = requestCommand(
+            {
+                command = "cancel"
+            },
+            "CANCEL"
+        )
+
+    elseif id == "return" then
+        setActivity(
+            "Return selected",
+            "Entering cruise altitude"
+        )
+        reply = returnOrigin()
+
+    elseif id == "position" then
+        setActivity(
+            "Set position selected",
+            "Entering coordinates"
+        )
+        reply = setPosition()
+
+    elseif id == "chunk" then
+        setActivity(
+            "Chunk grid selected",
+            "Entering southwest corner"
+        )
+        setChunkGrid()
+        draw()
+        return true
+
+    elseif id == "update" then
+        setActivity(
+            "Update selected",
+            "Awaiting confirmation"
+        )
+        reply = updatePlatform()
+
+    elseif id == "refresh" then
+        refreshStatus()
+        return true
+
+    elseif id == "navupdate" then
+        setActivity(
+            "Nav update selected",
+            "Awaiting confirmation"
+        )
+        updateController()
+        draw()
+        return true
+
+    elseif id == "exit" then
+        return false
+    end
+
+    if reply then
+        local status = requestStatus()
+
+        if status and status.type == "status" then
+            lastStatus = status
+        end
+    end
+
+    draw()
+
+    return true
+end
+
+local function hit(x, y)
+    for _, button in ipairs(buttons) do
+        if
+            x >= button.x1 and
+            x <= button.x2 and
+            y >= button.y1 and
+            y <= button.y2
+        then
+            return button.id
+        end
+    end
+
+    return nil
+end
+
+if os.getComputerID() ~= CONTROL_ID then
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("CAIRN NAV")
+    print("")
+    print("Reserved for computer 2705.")
+    print("Current ID: " .. os.getComputerID())
+    return
+end
+
+local wirelessSide = openWireless()
+
+if not wirelessSide then
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("CAIRN NAV")
+    print("")
+    print("No wireless modem found.")
+    return
+end
+
+activity = "Starting"
+detail = "Wireless modem " .. wirelessSide
+
+refreshStatus()
+
+local timer = os.startTimer(2.5)
+
+while true do
+    local event, a, b, c = os.pullEvent()
+
+    if event == "mouse_click" then
+        local id = hit(b, c)
+
+        if id then
+            if not handle(id) then
+                break
+            end
+
+            timer = os.startTimer(2.5)
+        end
+
+    elseif event == "char" then
+        local key = string.lower(a)
+
+        local shortcuts = {
+            ["1"] = "destination",
+            ["7"] = "quarry",
+            ["2"] = "pause",
+            ["3"] = "resume",
+            ["4"] = "cancel",
+            ["5"] = "return",
+            ["6"] = "position",
+            ["c"] = "chunk",
+            ["u"] = "update",
+            ["n"] = "navupdate",
+            ["r"] = "refresh",
+            ["q"] = "exit"
+        }
+
+        if shortcuts[key] then
+            if not handle(shortcuts[key]) then
+                break
+            end
+
+            timer = os.startTimer(2.5)
+        end
+
+    elseif event == "timer" and a == timer then
+        local status = requestStatus()
+
+        if status and status.type == "status" then
+            lastStatus = status
+        end
+
+        draw()
+        timer = os.startTimer(2.5)
+    end
+end
+
+resetColors()
+term.clear()
+term.setCursorPos(1, 1)
+print("CAIRN control offline")
