@@ -2,7 +2,10 @@ local SEED_PROTOCOL="miner_swarm_seed_v121"
 local RM_MODEM_SIDE="left"
 local CAIRN_QUARRY_PROTOCOL="cairn.quarry.v2"
 local CAIRN_MASTER_ID=2700
-local CAIRN_DOCK_ID=2701
+local CAIRN_DOCK_ID=2700
+local CAIRN_RELAY_ID=2701
+local CAIRN_GEOMETRY_VERSION=3
+local CAIRN_RANGE_CHANNEL=65000
 local CAIRN_STATE_FILE="cairn_rm.cfg"
 
 local function openRegionalManagerNetwork()
@@ -77,7 +80,10 @@ local function cairnTargetSouthWest(position,gridSouthWest)
 end
 
 local function cairnExpectedGeometry(message)
-    if tonumber(message.version)~=2 then return nil,"Unsupported Cairn quarry geometry version" end
+    if tonumber(message.version)~=CAIRN_GEOMETRY_VERSION then
+        return nil,"Unsupported Cairn quarry geometry version "..tostring(message.version)..
+            "; Cairn and the Regional Manager must both be updated"
+    end
     if not cairnPoint(message.routeStart) then return nil,"Quarry route start is missing" end
     if not cairnPoint(message.cairn) then return nil,"Cairn destination is missing" end
     if not cairnGridPoint(message.gridSouthWest) then return nil,"Chunk-grid southwest calibration is missing" end
@@ -90,7 +96,7 @@ local function cairnExpectedGeometry(message)
     local groundY=message.cairn.y-3
     local worldOrigin={x=southWest.x-1,y=groundY,z=southWest.z}
     local seed={x=worldOrigin.x,y=groundY,z=worldOrigin.z+1}
-    local dock={x=message.cairn.x,y=message.cairn.y+1,z=message.cairn.z-4}
+    local dock={x=message.cairn.x,y=message.cairn.y+1,z=message.cairn.z}
     local expected={
         cairn={x=message.cairn.x,y=message.cairn.y,z=message.cairn.z},
         routeStart={x=message.routeStart.x,y=message.routeStart.y,z=message.routeStart.z},
@@ -131,34 +137,213 @@ local function cairnExpectedGeometry(message)
     return expected
 end
 
-local function cairnLocate()
-    if not gps or not gps.locate then return nil end
-    local ok,x,y,z=pcall(gps.locate,2,false)
-    if not ok or type(x)~="number" or type(y)~="number" or type(z)~="number" then
-        return nil
-    end
-    return {x=x,y=y,z=z}
-end
-
-local function cairnVerifyPosition(expected,label)
-    if not cairnPoint(expected) then
-        return false,tostring(label or "position").." is missing"
-    end
-    local actual=cairnLocate()
-    if not actual then
-        return false,"GPS unavailable while verifying "..tostring(label or "position")
+local function cairnVerifyPosition(expected,label,actual)
+    if not cairnPoint(expected) or not cairnPoint(actual) then
+        return false,tostring(label or "position").." tracking is missing"
     end
     if not cairnNear(actual,expected) then
-        return false,tostring(label or "position").." mismatch: expected "..
-            tostring(expected.x)..","..tostring(expected.y)..","..tostring(expected.z)..
-            " got "..tostring(actual.x)..","..tostring(actual.y)..","..tostring(actual.z)
+        return false,tostring(label or "position").." tracked position does not match job geometry"
     end
     return true
 end
 
+local function cairnOnDock()
+    local ok,id=pcall(peripheral.call,"bottom","getID")
+    return ok and tonumber(id)==CAIRN_DOCK_ID
+end
+
+local function cairnSafeCancel(state)
+    return state.phase=="ERROR" and not state.routeIntent and
+        not state.undockMoved and state.job and
+        cairnNear(state.current,state.job.dock) and cairnOnDock()
+end
+
+local RANGE_DIR={[DIR_N]={0,-1},[DIR_E]={1,0},[DIR_S]={0,1},[DIR_W]={-1,0}}
+
+local function rangeFuel()
+    if not turtle or type(turtle.getFuelLevel)~="function" then return nil end
+    local level=turtle.getFuelLevel()
+    if type(level)=="number" then return level end
+    return nil
+end
+
+local function rangeCopy(p)
+    return {x=p.x,y=p.y,z=p.z}
+end
+
+local function rangeDistance(a,b)
+    local dx,dy,dz=a.x-b.x,a.y-b.y,a.z-b.z
+    return math.sqrt(dx*dx+dy*dy+dz*dz)
+end
+
+local function cairnAnchors(job)
+    if type(job)~="table" or not cairnPoint(job.cairn) or not cairnPoint(job.drive1) then return nil end
+    return {
+        [CAIRN_MASTER_ID]=rangeCopy(job.cairn),
+        [CAIRN_RELAY_ID]=rangeCopy(job.drive1)
+    }
+end
+
+local function rangeMeasure()
+    openRegionalManagerNetwork()
+    if not pcall(peripheral.call,RM_MODEM_SIDE,"open",CAIRN_RANGE_CHANNEL) then return nil end
+    local result={}
+    for attempt=1,8 do
+        local nonce=tostring(os.getComputerID())..":"..tostring(attempt)..":"..tostring(math.random(1,1000000000))
+        for _,target in ipairs({CAIRN_MASTER_ID,CAIRN_RELAY_ID}) do
+            if not result[target] then
+                pcall(rednet.send,target,{type="range_ping",target=target,nonce=nonce},CAIRN_QUARRY_PROTOCOL)
+            end
+        end
+        local timer=os.startTimer(1)
+        while true do
+            local event,p1,p2,p3,p4,p5=os.pullEvent()
+            if event=="timer" and p1==timer then break end
+            local channel,message,distance=p2,p4,p5
+            if event=="modem_message" and channel==CAIRN_RANGE_CHANNEL and type(message)=="table" and
+                message.type=="range_pong" and message.nonce==nonce and type(distance)=="number" then
+                local id=tonumber(message.id)
+                if id==CAIRN_MASTER_ID or id==CAIRN_RELAY_ID then result[id]=distance end
+                if result[CAIRN_MASTER_ID] and result[CAIRN_RELAY_ID] then return result end
+            end
+        end
+    end
+    return nil
+end
+
+local function rangePick(intent,after,anchors)
+    local sign=intent.move=="forward" and 1 or -1
+    local best,bestErr,secondErr=nil,math.huge,math.huge
+    for _,facing in ipairs(intent.candidates) do
+        local v=RANGE_DIR[facing]
+        local moved={x=intent.start.x+sign*v[1],y=intent.start.y,z=intent.start.z+sign*v[2]}
+        local err=0
+        for id,anchor in pairs(anchors) do
+            local before=tonumber(intent.r0[id])
+            local now=tonumber(after[id])
+            if not before or not now then return nil end
+            err=err+math.abs((now-before)-(rangeDistance(moved,anchor)-rangeDistance(intent.start,anchor)))
+        end
+        if err<bestErr then
+            secondErr=bestErr
+            best=facing
+            bestErr=err
+        elseif err<secondErr then
+            secondErr=err
+        end
+    end
+    if best and bestErr<0.4 and secondErr-bestErr>0.3 then return best end
+    return nil
+end
+
+local function rangeResolveFacing(intent,anchors,store)
+    if not anchors then return false,"Cairn reference positions are unavailable" end
+    while true do
+        if intent.kind=="facing" then
+            local before=rangeMeasure()
+            if not before then return false,"Cairn did not answer the range check" end
+            local probed=false
+            for _,move in ipairs({"forward","back"}) do
+                local fuel=rangeFuel()
+                if not fuel then return false,"Fuel level is unavailable for the facing check" end
+                local probe={kind="facingProbe",candidates=intent.candidates,start=intent.start,
+                    fuel=fuel,r0=before,move=move}
+                store(probe)
+                local fn=move=="forward" and turtle.forward or turtle.back
+                if fn() then
+                    intent=probe
+                    probed=true
+                    break
+                end
+                store(intent)
+            end
+            if not probed then return false,"The Regional Manager is boxed in and cannot check its facing" end
+        elseif intent.kind=="facingProbe" then
+            local fuel=rangeFuel()
+            if fuel==intent.fuel then
+                intent={kind="facing",candidates=intent.candidates,start=intent.start}
+                store(intent)
+            elseif fuel==intent.fuel-1 then
+                local after=rangeMeasure()
+                if not after then return false,"Cairn did not answer the range check" end
+                local facing=rangePick(intent,after,anchors)
+                if not facing then return false,"The range check could not tell which way the Regional Manager faces" end
+                intent={kind="facingReturn",facing=facing,start=intent.start,fuel=fuel,
+                    move=intent.move=="forward" and "back" or "forward"}
+                store(intent)
+            else
+                return false,"Fuel changed unexpectedly during the facing check"
+            end
+        elseif intent.kind=="facingReturn" then
+            local fuel=rangeFuel()
+            if fuel==intent.fuel then
+                local fn=intent.move=="forward" and turtle.forward or turtle.back
+                if not fn() then return false,"The Regional Manager could not return after checking its facing" end
+                fuel=intent.fuel-1
+            end
+            if fuel~=intent.fuel-1 then return false,"Fuel changed unexpectedly during the facing check" end
+            return true,intent.facing,intent.start
+        else
+            return false,"Unknown interrupted movement "..tostring(intent.kind)
+        end
+    end
+end
+
+local function cairnRecoverIntent(state)
+    local intent=state.routeIntent
+    if not intent then return true end
+    local function store(value)
+        state.routeIntent=value
+        saveCairnState(state)
+    end
+    if intent.kind=="up" or intent.kind=="down" or intent.kind=="forward" then
+        local fuel=rangeFuel()
+        if not cairnPoint(intent.current) or not tonumber(intent.fuel) or not fuel then
+            return false,"Interrupted Cairn movement cannot be checked without a fuel reading"
+        end
+        local current=rangeCopy(intent.current)
+        if fuel==intent.fuel-1 then
+            if intent.kind=="up" then current.y=current.y+1
+            elseif intent.kind=="down" then current.y=current.y-1
+            else
+                local v=RANGE_DIR[tonumber(intent.dir)]
+                if not v then return false,"Interrupted forward move has no facing" end
+                current.x=current.x+v[1]
+                current.z=current.z+v[2]
+            end
+            state.undockMoved=true
+        elseif fuel~=intent.fuel then
+            return false,"Fuel changed unexpectedly during an interrupted Cairn movement"
+        end
+        state.current=current
+        store(nil)
+        return true
+    end
+    if intent.kind=="turnRight" then
+        if not cairnPoint(state.current) then return false,"Interrupted Cairn turn has no tracked position" end
+        local dir=tonumber(intent.dir) or tonumber(state.dir)
+        intent={kind="facing",candidates={dir%4,(dir+1)%4},start=rangeCopy(state.current)}
+        store(intent)
+    end
+    local ok,facing,start=rangeResolveFacing(intent,cairnAnchors(state.job),store)
+    if not ok then return false,facing end
+    state.dir=facing
+    state.current=rangeCopy(start)
+    if not cairnNear(state.current,state.job and state.job.dock) then state.undockMoved=true end
+    store(nil)
+    return true
+end
+
 local function cairnTurnRight(state)
-    if not turtle.turnRight() then return false,"turn right failed" end
+    state.routeIntent={kind="turnRight",dir=state.dir}
+    saveCairnState(state)
+    if not turtle.turnRight() then
+        state.routeIntent=nil
+        saveCairnState(state)
+        return false,"turn right failed"
+    end
     state.dir=(state.dir+1)%4
+    state.routeIntent=nil
     saveCairnState(state)
     return true
 end
@@ -179,6 +364,7 @@ local function cairnMoveVertical(state,delta)
     for i=1,count do
         state.routeIntent={
             kind=command,
+            fuel=rangeFuel(),
             current=state.current and {
                 x=state.current.x,y=state.current.y,z=state.current.z
             } or nil
@@ -190,6 +376,7 @@ local function cairnMoveVertical(state,delta)
             saveCairnState(state)
             return false,tostring(reason or command.." blocked")
         end
+        state.undockMoved=true
         if state.current then
             state.current.y=state.current.y+(delta>0 and 1 or -1)
         end
@@ -204,6 +391,7 @@ local function cairnMoveForward(state,count)
         state.routeIntent={
             kind="forward",
             dir=state.dir,
+            fuel=rangeFuel(),
             current=state.current and {
                 x=state.current.x,y=state.current.y,z=state.current.z
             } or nil
@@ -215,6 +403,7 @@ local function cairnMoveForward(state,count)
             saveCairnState(state)
             return false,tostring(reason or "forward blocked")
         end
+        state.undockMoved=true
         if state.current then
             if state.dir==DIR_N then state.current.z=state.current.z-1
             elseif state.dir==DIR_E then state.current.x=state.current.x+1
@@ -266,6 +455,10 @@ local function cairnAcceptJob(state,message)
         return false,"Missing quarry job token"
     end
 
+    if state.routeIntent or (state.phase=="ERROR" and state.job and
+        tostring(state.job.jobToken)==tostring(message.jobToken)) then
+        return false,"Failed Cairn job requires cancellation and a new job"
+    end
     local geometry,reason=cairnExpectedGeometry(message)
     if not geometry then return false,reason end
 
@@ -282,6 +475,7 @@ local function cairnAcceptJob(state,message)
         worldOrigin=geometry.worldOrigin,
         chunk=geometry.chunk
     }
+    state.undockMoved=false
     state.phase="READY"
     state.active=true
     state.error=nil
@@ -302,29 +496,22 @@ local function cairnRunUndock(state)
     local job=state.job
     if type(job)~="table" then return false,"No Cairn quarry job is stored" end
 
+    if state.routeIntent then
+        return false,"Interrupted Cairn movement or turn requires position reconciliation"
+    end
+    if state.phase=="ERROR" then return false,state.error or "Cairn launch failed" end
+    if not cairnPoint(state.current) or not cairnInteger(state.dir) then
+        return false,"Cairn tracked position or facing is missing"
+    end
+    local verified,reason
+    if state.phase~="UNDOCKING" then
+        verified,reason=cairnVerifyPosition(job.dock,"Cairn dock",state.current)
+        if not verified then return false,reason end
+        if not cairnOnDock() then return false,"Regional Manager is not docked on Drive2" end
+    end
     state.phase="UNDOCKING"
     state.docked=false
-    state.dir=tonumber(state.dir) or DIR_N
-    state.current=state.current or {
-        x=job.dock.x,
-        y=job.dock.y,
-        z=job.dock.z
-    }
     saveCairnState(state)
-
-    local verified,reason=cairnVerifyPosition(job.dock,"Cairn dock")
-    if not verified then
-        cairnSend({
-            type="quarry_error",
-            jobToken=job.jobToken,
-            error=reason
-        })
-        state.phase="ERROR"
-        state.error=reason
-        state.docked=cairnDockBelow()
-        saveCairnState(state)
-        return false,reason
-    end
 
     local ok
     local delta=job.clear.y-state.current.y
@@ -347,7 +534,7 @@ local function cairnRunUndock(state)
     ok,reason=cairnFace(state,DIR_N)
     if not ok then return false,reason end
 
-    verified,reason=cairnVerifyPosition(job.seed,"quarry seed position")
+    verified,reason=cairnVerifyPosition(job.seed,"quarry seed position",state.current)
     if not verified then return false,reason end
 
     local seed={
@@ -412,7 +599,16 @@ end
 
 local function waitForCairnJob()
     local state=loadCairnState()
-    local physicallyDocked=cairnDockBelow()
+    if state and state.routeIntent then
+        openRegionalManagerNetwork()
+        local recovered,reason=cairnRecoverIntent(state)
+        if not recovered then
+            error("Interrupted Cairn movement or turn needs position reconciliation: "..tostring(reason))
+        end
+    end
+    local physicallyDocked=cairnOnDock()
+    if state and state.phase=="UNDOCKING" then return state end
+    if state and state.phase=="ERROR" and state.undockMoved then return state end
 
     if physicallyDocked then
         local recovered=type(state)~="table" or state.docked~=true
@@ -461,7 +657,7 @@ local function waitForCairnJob()
 
         local sender,message=rednet.receive(CAIRN_QUARRY_PROTOCOL,1)
 
-        if (tonumber(sender)==CAIRN_MASTER_ID or tonumber(sender)==CAIRN_DOCK_ID) and type(message)=="table" then
+        if (tonumber(sender)==CAIRN_MASTER_ID or tonumber(sender)==CAIRN_RELAY_ID) and type(message)=="table" then
             if message.type=="quarry_prepare" then
                 local ok,reason=cairnAcceptJob(state,message)
                 if ok then
@@ -505,7 +701,8 @@ local function waitForCairnJob()
                         cairnSend({
                             type="quarry_error",
                             jobToken=state.job.jobToken,
-                            error=reason
+                            error=reason,
+                            safeToCancel=cairnSafeCancel(state)
                         })
                     else
                         return state
@@ -525,7 +722,8 @@ local function waitForCairnJob()
                         type="quarry_status",
                         jobToken=state.job.jobToken,
                         phase=state.phase or "DOCKED",
-                        error=state.error
+                        error=state.error,
+                        safeToCancel=cairnSafeCancel(state)
                     })
                 end
             end
@@ -533,6 +731,58 @@ local function waitForCairnJob()
     end
 
     return state
+end
+
+local function seedRecoverIntent(seed,cairnState)
+    local intent=seed.moveIntent
+    local function store(value)
+        seed.moveIntent=value
+        if not saveTable("manager_seed.cfg",seed) then
+            error("Could not save Regional Manager seed state")
+        end
+    end
+    if intent.kind=="up" or intent.kind=="down" then
+        store(nil)
+        return true
+    end
+    if intent.kind=="forward" then
+        local fuel=rangeFuel()
+        if not tonumber(intent.fuel) or not fuel then
+            return false,"Interrupted seed move cannot be checked without a fuel reading"
+        end
+        seed.x,seed.y,seed.z,seed.dir=intent.x,intent.y,intent.z,intent.dir
+        if fuel==intent.fuel-1 then
+            if seed.dir==DIR_N then seed.z=seed.z+1
+            elseif seed.dir==DIR_E then seed.x=seed.x+1
+            elseif seed.dir==DIR_S then seed.z=seed.z-1
+            else seed.x=seed.x-1 end
+        elseif fuel~=intent.fuel then
+            return false,"Fuel changed unexpectedly during an interrupted seed move"
+        end
+        store(nil)
+        return true
+    end
+    local origin=seed.worldOrigin
+    if type(origin)~="table" or not tonumber(origin.x) then
+        return false,"Seed world origin is unknown"
+    end
+    local anchors=cairnAnchors(type(cairnState)=="table" and cairnState.job or nil)
+    if not anchors then
+        local saved=loadCairnState()
+        anchors=cairnAnchors(saved and saved.job)
+    end
+    if intent.kind=="turnRight" then
+        local dir=tonumber(intent.dir) or tonumber(seed.dir) or DIR_N
+        seed.x,seed.y,seed.z=intent.x,intent.y,intent.z
+        intent={kind="facing",candidates={dir%4,(dir+1)%4},
+            start={x=origin.x+intent.x,y=origin.y+intent.y,z=origin.z-intent.z}}
+        store(intent)
+    end
+    local ok,facing=rangeResolveFacing(intent,anchors,store)
+    if not ok then return false,facing end
+    seed.dir=facing
+    store(nil)
+    return true
 end
 
 local function runManagerSeedBootstrap()
@@ -548,6 +798,12 @@ local function runManagerSeedBootstrap()
     end
 
     local seed=loadTable("manager_seed.cfg")
+    if type(seed)=="table" and seed.moveIntent then
+        local recovered,reason=seedRecoverIntent(seed,cairnState)
+        if not recovered then
+            error("Interrupted seed movement needs position reconciliation: "..tostring(reason))
+        end
+    end
     if type(seed)=="table" and seed.complete==true then
         return seed
     end
@@ -666,8 +922,17 @@ local function runManagerSeedBootstrap()
         end
     end
 
+    local function seedStep(fn,kind)
+        seed.moveIntent={kind=kind,x=seed.x,y=seed.y,z=seed.z,dir=seed.dir,fuel=rangeFuel()}
+        saveSeed()
+        local ok=fn()
+        seed.moveIntent=nil
+        if not ok then saveSeed() end
+        return ok
+    end
+
     local function turnRightSeed()
-        if not turtle.turnRight() then return false end
+        if not seedStep(turtle.turnRight,"turnRight") then return false end
         seed.dir=(seed.dir+1)%4
         saveSeed()
         return true
@@ -746,7 +1011,7 @@ local function runManagerSeedBootstrap()
 
     local function forwardSeed()
         for attempt=1,20 do
-            local ok=turtle.forward()
+            local ok=seedStep(turtle.forward,"forward")
             if ok then
                 if seed.dir==DIR_N then seed.z=seed.z+1
                 elseif seed.dir==DIR_E then seed.x=seed.x+1
@@ -1236,7 +1501,7 @@ local function runManagerSeedBootstrap()
         if frontType=="drive" then
             seed.y=1
         elseif okId and tonumber(idFront)==tonumber(seed.masterId) then
-            if not turtle.up() then error("Regional Manager could not rise to the bootstrap Disk Drive") end
+            if not seedStep(turtle.up,"up") then error("Regional Manager could not rise to the bootstrap Disk Drive") end
             seed.y=1
             sleep(0.2)
         else
@@ -1289,7 +1554,7 @@ local function runManagerSeedBootstrap()
         if okId and tonumber(idFront)==tonumber(seed.masterId) then
             seed.y=0
         else
-            if not turtle.down() then error("Regional Manager could not descend after recovering the bootstrap installer") end
+            if not seedStep(turtle.down,"down") then error("Regional Manager could not descend after recovering the bootstrap installer") end
             seed.y=0
             sleep(0.2)
         end
@@ -1352,7 +1617,7 @@ local function runManagerSeedBootstrap()
 
     if seed.phase=="AT_IDLE" then
         if cairnPoint(seed.idleWorld) then
-            local verified,reason=cairnVerifyPosition(seed.idleWorld,"calculated quarry idle position")
+            local verified,reason=cairnVerifyPosition(seed.idleWorld,"calculated quarry idle position",{x=seed.worldOrigin.x+seed.x,y=seed.worldOrigin.y+seed.y,z=seed.worldOrigin.z-seed.z})
             if not verified then error(reason or "Regional Manager idle position verification failed") end
         end
         seed.complete=true
@@ -2088,6 +2353,7 @@ local function runRegionalManager()
                 }
             end
             local f=data.foremen[n]
+            local nav=data.navigators[n]
             clusters[n]={
                 foremanState=fs,
                 foremanOnline=f and online(f,20) or false,
@@ -3899,8 +4165,10 @@ local function runRegionalManager()
             return false,"RM tracked dock position does not match Cairn geometry"
         end
 
-        local verified,verifyReason=cairnVerifyPosition(job.dock,"Cairn return dock")
+        local verified,verifyReason=cairnVerifyPosition(job.dock,"Cairn return dock",{x=expectedX,y=expectedY,z=expectedZ})
         if not verified then return false,verifyReason end
+
+        if not cairnOnDock() then return false,"Regional Manager return dock is not Drive2" end
 
         cairnJob.phase="DOCKED"
         cairnJob.docked=true
@@ -4933,7 +5201,7 @@ local function runRegionalManager()
             if protocol==DEBUG_PROTOCOL and type(message)=="table" then
                 debugIngest(sender,message)
             elseif protocol==CAIRN_QUARRY_PROTOCOL and type(message)=="table" and
-                (tonumber(sender)==CAIRN_MASTER_ID or tonumber(sender)==CAIRN_DOCK_ID) then
+                (tonumber(sender)==CAIRN_MASTER_ID or tonumber(sender)==CAIRN_RELAY_ID) then
                 if cairnJobActive() and
                     tostring(message.jobToken or "")==tostring(cairnJob.job.jobToken or "") then
                     if message.type=="quarry_status_query" or

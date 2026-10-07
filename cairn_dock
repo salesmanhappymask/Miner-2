@@ -42,5 +42,5 @@ if not writeTable(CAIRN_STATE_FILE,cfg) then
 end
 
 print("Cairn dock mode enabled.")
-print("Regional Manager will wait for Drive1 / 2701.")
+print("Regional Manager will wait for Drive2 / 2700.")
 print("Reboot when ready.")
