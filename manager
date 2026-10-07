@@ -131,34 +131,37 @@ local function cairnExpectedGeometry(message)
     return expected
 end
 
-local function cairnLocate()
-    if not gps or not gps.locate then return nil end
-    local ok,x,y,z=pcall(gps.locate,2,false)
-    if not ok or type(x)~="number" or type(y)~="number" or type(z)~="number" then
-        return nil
-    end
-    return {x=x,y=y,z=z}
-end
-
-local function cairnVerifyPosition(expected,label)
-    if not cairnPoint(expected) then
-        return false,tostring(label or "position").." is missing"
-    end
-    local actual=cairnLocate()
-    if not actual then
-        return false,"GPS unavailable while verifying "..tostring(label or "position")
+local function cairnVerifyPosition(expected,label,actual)
+    if not cairnPoint(expected) or not cairnPoint(actual) then
+        return false,tostring(label or "position").." tracking is missing"
     end
     if not cairnNear(actual,expected) then
-        return false,tostring(label or "position").." mismatch: expected "..
-            tostring(expected.x)..","..tostring(expected.y)..","..tostring(expected.z)..
-            " got "..tostring(actual.x)..","..tostring(actual.y)..","..tostring(actual.z)
+        return false,tostring(label or "position").." tracked position does not match job geometry"
     end
     return true
 end
 
+local function cairnOnDrive1()
+    local ok,id=pcall(peripheral.call,"bottom","getID")
+    return ok and tonumber(id)==CAIRN_DOCK_ID
+end
+
+local function cairnSafeCancel(state)
+    return state.phase=="ERROR" and not state.routeIntent and
+        not state.undockMoved and state.job and
+        cairnNear(state.current,state.job.dock) and cairnOnDrive1()
+end
+
 local function cairnTurnRight(state)
-    if not turtle.turnRight() then return false,"turn right failed" end
+    state.routeIntent={kind="turnRight",dir=state.dir}
+    saveCairnState(state)
+    if not turtle.turnRight() then
+        state.routeIntent=nil
+        saveCairnState(state)
+        return false,"turn right failed"
+    end
     state.dir=(state.dir+1)%4
+    state.routeIntent=nil
     saveCairnState(state)
     return true
 end
@@ -190,6 +193,7 @@ local function cairnMoveVertical(state,delta)
             saveCairnState(state)
             return false,tostring(reason or command.." blocked")
         end
+        state.undockMoved=true
         if state.current then
             state.current.y=state.current.y+(delta>0 and 1 or -1)
         end
@@ -215,6 +219,7 @@ local function cairnMoveForward(state,count)
             saveCairnState(state)
             return false,tostring(reason or "forward blocked")
         end
+        state.undockMoved=true
         if state.current then
             if state.dir==DIR_N then state.current.z=state.current.z-1
             elseif state.dir==DIR_E then state.current.x=state.current.x+1
@@ -266,6 +271,10 @@ local function cairnAcceptJob(state,message)
         return false,"Missing quarry job token"
     end
 
+    if state.routeIntent or (state.phase=="ERROR" and state.job and
+        tostring(state.job.jobToken)==tostring(message.jobToken)) then
+        return false,"Failed Cairn job requires cancellation and a new job"
+    end
     local geometry,reason=cairnExpectedGeometry(message)
     if not geometry then return false,reason end
 
@@ -282,6 +291,7 @@ local function cairnAcceptJob(state,message)
         worldOrigin=geometry.worldOrigin,
         chunk=geometry.chunk
     }
+    state.undockMoved=false
     state.phase="READY"
     state.active=true
     state.error=nil
@@ -302,29 +312,22 @@ local function cairnRunUndock(state)
     local job=state.job
     if type(job)~="table" then return false,"No Cairn quarry job is stored" end
 
+    if state.routeIntent then
+        return false,"Interrupted Cairn movement or turn requires position reconciliation"
+    end
+    if state.phase=="ERROR" then return false,state.error or "Cairn launch failed" end
+    if not cairnPoint(state.current) or not cairnInteger(state.dir) then
+        return false,"Cairn tracked position or facing is missing"
+    end
+    local verified,reason
+    if state.phase~="UNDOCKING" then
+        verified,reason=cairnVerifyPosition(job.dock,"Cairn dock",state.current)
+        if not verified then return false,reason end
+        if not cairnOnDrive1() then return false,"Regional Manager is not docked on Drive1" end
+    end
     state.phase="UNDOCKING"
     state.docked=false
-    state.dir=tonumber(state.dir) or DIR_N
-    state.current=state.current or {
-        x=job.dock.x,
-        y=job.dock.y,
-        z=job.dock.z
-    }
     saveCairnState(state)
-
-    local verified,reason=cairnVerifyPosition(job.dock,"Cairn dock")
-    if not verified then
-        cairnSend({
-            type="quarry_error",
-            jobToken=job.jobToken,
-            error=reason
-        })
-        state.phase="ERROR"
-        state.error=reason
-        state.docked=cairnDockBelow()
-        saveCairnState(state)
-        return false,reason
-    end
 
     local ok
     local delta=job.clear.y-state.current.y
@@ -347,7 +350,7 @@ local function cairnRunUndock(state)
     ok,reason=cairnFace(state,DIR_N)
     if not ok then return false,reason end
 
-    verified,reason=cairnVerifyPosition(job.seed,"quarry seed position")
+    verified,reason=cairnVerifyPosition(job.seed,"quarry seed position",state.current)
     if not verified then return false,reason end
 
     local seed={
@@ -412,7 +415,12 @@ end
 
 local function waitForCairnJob()
     local state=loadCairnState()
-    local physicallyDocked=cairnDockBelow()
+    if state and state.routeIntent then
+        error("Interrupted Cairn movement or turn requires position reconciliation")
+    end
+    local physicallyDocked=cairnOnDrive1()
+    if state and state.phase=="UNDOCKING" then return state end
+    if state and state.phase=="ERROR" and state.undockMoved then return state end
 
     if physicallyDocked then
         local recovered=type(state)~="table" or state.docked~=true
@@ -505,7 +513,8 @@ local function waitForCairnJob()
                         cairnSend({
                             type="quarry_error",
                             jobToken=state.job.jobToken,
-                            error=reason
+                            error=reason,
+                            safeToCancel=cairnSafeCancel(state)
                         })
                     else
                         return state
@@ -525,7 +534,8 @@ local function waitForCairnJob()
                         type="quarry_status",
                         jobToken=state.job.jobToken,
                         phase=state.phase or "DOCKED",
-                        error=state.error
+                        error=state.error,
+                        safeToCancel=cairnSafeCancel(state)
                     })
                 end
             end
@@ -548,6 +558,7 @@ local function runManagerSeedBootstrap()
     end
 
     local seed=loadTable("manager_seed.cfg")
+    if type(seed)=="table" and seed.moveIntent then error("Interrupted seed movement requires position reconciliation") end
     if type(seed)=="table" and seed.complete==true then
         return seed
     end
@@ -666,8 +677,17 @@ local function runManagerSeedBootstrap()
         end
     end
 
+    local function seedStep(fn,kind)
+        seed.moveIntent={kind=kind,x=seed.x,y=seed.y,z=seed.z,dir=seed.dir}
+        saveSeed()
+        local ok=fn()
+        seed.moveIntent=nil
+        if not ok then saveSeed() end
+        return ok
+    end
+
     local function turnRightSeed()
-        if not turtle.turnRight() then return false end
+        if not seedStep(turtle.turnRight,"turnRight") then return false end
         seed.dir=(seed.dir+1)%4
         saveSeed()
         return true
@@ -746,7 +766,7 @@ local function runManagerSeedBootstrap()
 
     local function forwardSeed()
         for attempt=1,20 do
-            local ok=turtle.forward()
+            local ok=seedStep(turtle.forward,"forward")
             if ok then
                 if seed.dir==DIR_N then seed.z=seed.z+1
                 elseif seed.dir==DIR_E then seed.x=seed.x+1
@@ -1236,7 +1256,7 @@ local function runManagerSeedBootstrap()
         if frontType=="drive" then
             seed.y=1
         elseif okId and tonumber(idFront)==tonumber(seed.masterId) then
-            if not turtle.up() then error("Regional Manager could not rise to the bootstrap Disk Drive") end
+            if not seedStep(turtle.up,"up") then error("Regional Manager could not rise to the bootstrap Disk Drive") end
             seed.y=1
             sleep(0.2)
         else
@@ -1289,7 +1309,7 @@ local function runManagerSeedBootstrap()
         if okId and tonumber(idFront)==tonumber(seed.masterId) then
             seed.y=0
         else
-            if not turtle.down() then error("Regional Manager could not descend after recovering the bootstrap installer") end
+            if not seedStep(turtle.down,"down") then error("Regional Manager could not descend after recovering the bootstrap installer") end
             seed.y=0
             sleep(0.2)
         end
@@ -1352,7 +1372,7 @@ local function runManagerSeedBootstrap()
 
     if seed.phase=="AT_IDLE" then
         if cairnPoint(seed.idleWorld) then
-            local verified,reason=cairnVerifyPosition(seed.idleWorld,"calculated quarry idle position")
+            local verified,reason=cairnVerifyPosition(seed.idleWorld,"calculated quarry idle position",{x=seed.worldOrigin.x+seed.x,y=seed.worldOrigin.y+seed.y,z=seed.worldOrigin.z-seed.z})
             if not verified then error(reason or "Regional Manager idle position verification failed") end
         end
         seed.complete=true
@@ -3899,8 +3919,10 @@ local function runRegionalManager()
             return false,"RM tracked dock position does not match Cairn geometry"
         end
 
-        local verified,verifyReason=cairnVerifyPosition(job.dock,"Cairn return dock")
+        local verified,verifyReason=cairnVerifyPosition(job.dock,"Cairn return dock",{x=expectedX,y=expectedY,z=expectedZ})
         if not verified then return false,verifyReason end
+
+        if not cairnOnDrive1() then return false,"Regional Manager return dock is not Drive1" end
 
         cairnJob.phase="DOCKED"
         cairnJob.docked=true
