@@ -86,7 +86,6 @@ end
 local running = shell.getRunningProgram() or ""
 local fromDisk = running:match("^/?disk/") ~= nil
 local autoReboot=false
-local preserveState=false
 local explicitRole=nil
 for _,arg in ipairs(args) do
     if arg=="--reboot" or arg=="--auto-reboot" then
@@ -275,9 +274,7 @@ if fetch("version"):match("^%s*(%d+)%s*$") ~= version then
     error("Remote version changed after snapshot validation; nothing was changed")
 end
 
-if not preserveState then
-    prepareFreshRoot()
-end
+prepareFreshRoot()
 
 local stageDir = ".update_stage"
 if fs.exists(stageDir) then fs.delete(stageDir) end
@@ -288,206 +285,56 @@ end
 writeFile(fs.combine(stageDir, "version"), version)
 writeFile(fs.combine(stageDir, "update"), updaterSource)
 
-if not preserveState then
-    local installOrder={}
-    for _,name in ipairs(files) do installOrder[#installOrder+1]=name end
-    installOrder[#installOrder+1]="version"
-    for _,name in ipairs(installOrder) do
-        local stagedPath=fs.combine(stageDir,name)
-        if not fs.exists(stagedPath) then
-            error("Fresh update staging lost " .. name)
-        end
-        if fs.exists(name) then fs.delete(name) end
-        fs.move(stagedPath,name)
+local installOrder={}
+for _,name in ipairs(files) do installOrder[#installOrder+1]=name end
+installOrder[#installOrder+1]="version"
+for _,name in ipairs(installOrder) do
+    local stagedPath=fs.combine(stageDir,name)
+    if not fs.exists(stagedPath) then
+        error("Fresh update staging lost " .. name)
     end
-
-    writeFile("update.new", updaterSource)
-    if fs.exists("update.old") then fs.delete("update.old") end
-    local movedOld=false
-    if fs.exists("update") then
-        fs.move("update","update.old")
-        movedOld=true
-    end
-    local okUpdater,updaterErr=pcall(fs.move,"update.new","update")
-    if not okUpdater or not fs.exists("update") then
-        if fs.exists("update") then fs.delete("update") end
-        if movedOld and fs.exists("update.old") then fs.move("update.old","update") end
-        error("Fresh update updater self-refresh failed: " .. tostring(updaterErr))
-    end
-    if readFile("update") ~= updaterSource then
-        if fs.exists("update") then fs.delete("update") end
-        if movedOld and fs.exists("update.old") then fs.move("update.old","update") end
-        error("Fresh update updater verification failed; previous updater restored")
-    end
-    if fs.exists("update.old") then fs.delete("update.old") end
-
-    saveConfig(role)
-    if role=="master" and anchor then
-        writeFile("world_anchor", textutils.serialize(anchor))
-    end
-    writeFile(".clean_install_release", version)
-    if fs.exists(stageDir) then fs.delete(stageDir) end
-
-    for _, name in ipairs(files) do
-        if readFile(name) ~= staged[name] then
-            error("Fresh update verification failed: " .. name)
-        end
-    end
-    if readFile("version") ~= version then
-        error("Fresh update verification failed: version")
-    end
-    local verifyConfig=loadConfig()
-    if not verifyConfig or verifyConfig.role~=role then
-        error("Fresh update verification failed: updater role")
-    end
-
-    if role == "manager" then
-        os.setComputerLabel("Regional Manager")
-    else
-        os.setComputerLabel("Foreman-1")
-    end
-
-    print("")
-    print("Update complete.")
-    print("Installed version " .. version .. " for " .. roleName(role) .. ".")
-    print("The turtle writable root was wiped before the fresh runtime was installed.")
-    if autoReboot then
-        print("Rebooting into the updated release...")
-        sleep(1)
-        os.reboot()
-    end
-    print("No program was launched and the turtle was not rebooted.")
-    print("Run startup or reboot when you are ready to start the quarry software.")
-    return
+    if fs.exists(name) then fs.delete(name) end
+    fs.move(stagedPath,name)
 end
 
-local backupDir = ".update_backup"
-if fs.exists(backupDir) then fs.delete(backupDir) end
-fs.makeDir(backupDir)
-
-local managed = {}
-for _, name in ipairs(files) do managed[#managed+1] = name end
-managed[#managed+1] = "version"
-
-for _, name in ipairs(managed) do
-    if fs.exists(name) then
-        fs.move(name, fs.combine(backupDir, name))
-    end
+writeFile("update.new", updaterSource)
+if fs.exists("update.old") then fs.delete("update.old") end
+local movedOld=false
+if fs.exists("update") then
+    fs.move("update","update.old")
+    movedOld=true
 end
-
-local committed = {}
-local okCommit, commitErr = pcall(function()
-    for _, name in ipairs(files) do
-        fs.move(fs.combine(stageDir, name), name)
-        committed[#committed+1] = name
-    end
-    fs.move(fs.combine(stageDir, "version"), "version")
-    committed[#committed+1] = "version"
-end)
-
-local function restoreManagedFiles()
-    for _, name in ipairs(managed) do
-        if fs.exists(name) then fs.delete(name) end
-        local backup = fs.combine(backupDir, name)
-        if fs.exists(backup) then fs.move(backup, name) end
-    end
+local okUpdater,updaterErr=pcall(fs.move,"update.new","update")
+if not okUpdater or not fs.exists("update") then
+    if fs.exists("update") then fs.delete("update") end
+    if movedOld and fs.exists("update.old") then fs.move("update.old","update") end
+    error("Fresh update updater self-refresh failed: " .. tostring(updaterErr))
 end
-
-if not okCommit then
-    restoreManagedFiles()
-    if fs.exists(stageDir) then fs.delete(stageDir) end
-    if fs.exists(backupDir) then fs.delete(backupDir) end
-    error("Update commit failed and previous runtime files were restored: " .. tostring(commitErr))
+if readFile("update") ~= updaterSource then
+    if fs.exists("update") then fs.delete("update") end
+    if movedOld and fs.exists("update.old") then fs.move("update.old","update") end
+    error("Fresh update updater verification failed; previous updater restored")
 end
+if fs.exists("update.old") then fs.delete("update.old") end
+
+saveConfig(role)
+if role=="master" and anchor then
+    writeFile("world_anchor", textutils.serialize(anchor))
+end
+writeFile(".clean_install_release", version)
+if fs.exists(stageDir) then fs.delete(stageDir) end
 
 for _, name in ipairs(files) do
     if readFile(name) ~= staged[name] then
-        restoreManagedFiles()
-        if fs.exists(stageDir) then fs.delete(stageDir) end
-        if fs.exists(backupDir) then fs.delete(backupDir) end
-        error("Final verification failed: " .. name .. "; previous runtime files restored")
+        error("Fresh update verification failed: " .. name)
     end
 end
 if readFile("version") ~= version then
-    restoreManagedFiles()
-    if fs.exists(stageDir) then fs.delete(stageDir) end
-    if fs.exists(backupDir) then fs.delete(backupDir) end
-    error("Final verification failed: version; previous runtime files restored")
+    error("Fresh update verification failed: version")
 end
-
-saveConfig(role)
-
-if fs.exists(stageDir) then fs.delete(stageDir) end
-if fs.exists(backupDir) then fs.delete(backupDir) end
-
-if anchor and preserveState then
-    writeFile("world_anchor", textutils.serialize(anchor))
-end
-writeFile("update.new", updaterSource)
-if fs.exists("update.old") then fs.delete("update.old") end
-if fs.exists("update") then fs.move("update", "update.old") end
-fs.move("update.new", "update")
-if readFile("update") ~= updaterSource then
-    if fs.exists("update") then fs.delete("update") end
-    if fs.exists("update.old") then fs.move("update.old", "update") end
-    error("Updater self-refresh failed; previous updater restored")
-end
-if fs.exists("update.old") then fs.delete("update.old") end
-
-local function clearEphemeral()
-    local targets={"logs","diagnostics.txt",".runtime_crash_count"}
-    for _,name in ipairs(fs.list("")) do
-        if name:match("_error%.log$") then targets[#targets+1]=name end
-    end
-    for _,name in ipairs(targets) do
-        if fs.exists(name) then
-            local ok,err=pcall(fs.delete,name)
-            if not ok or fs.exists(name) then
-                error("Update installed, but could not clear stale diagnostic file " .. tostring(name) .. (err and (": " .. tostring(err)) or ""))
-            end
-        end
-    end
-end
-
-local function cleanReset()
-    local keep={
-        startup=true,
-        common=true,
-        prep=true,
-        push=true,
-        pushlogs=true,
-        version=true,
-        update=true,
-        [CONFIG]=true
-    }
-    keep[role == "manager" and "manager" or "foreman"]=true
-    if role=="master" then keep.world_anchor=true end
-    if role=="manager" then
-        keep["cairn_rm.cfg"]=true
-        keep.cairn_dock=true
-    end
-
-    local failures={}
-    for _,name in ipairs(fs.list("")) do
-        local mounted=name=="rom" or name:match("^disk%d*$")
-        if not keep[name] and not mounted then
-            local ok,err=pcall(fs.delete,name)
-            if not ok or fs.exists(name) then
-                failures[#failures+1]=name .. (err and (": " .. tostring(err)) or "")
-            end
-        end
-    end
-    if #failures>0 then
-        error("Update installed, but clean reset could not remove: " .. table.concat(failures, ", "))
-    end
-    if anchor then
-        writeFile("world_anchor", textutils.serialize(anchor))
-    end
-end
-
-clearEphemeral()
-if not preserveState then
-    cleanReset()
+local verifyConfig=loadConfig()
+if not verifyConfig or verifyConfig.role~=role then
+    error("Fresh update verification failed: updater role")
 end
 
 if role == "manager" then
@@ -499,11 +346,7 @@ end
 print("")
 print("Update complete.")
 print("Installed version " .. version .. " for " .. roleName(role) .. ".")
-if preserveState then
-    print("The permanent updater was refreshed, runtime state was preserved, and stale logs were cleared.")
-else
-    print("The permanent updater was refreshed and the turtle was reset to a clean " .. roleName(role) .. " default.")
-end
+print("The turtle writable root was wiped before the fresh runtime was installed.")
 if autoReboot then
     print("Rebooting into the updated release...")
     sleep(1)
@@ -511,3 +354,4 @@ if autoReboot then
 end
 print("No program was launched and the turtle was not rebooted.")
 print("Run startup or reboot when you are ready to start the quarry software.")
+return

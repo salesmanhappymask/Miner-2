@@ -1,4 +1,4 @@
-VERSION = 167
+VERSION = 168
 RELEASE_VERSION = VERSION
 STATE_SCHEMA_VERSION = 155
 PROTOCOL_VERSION = 121
@@ -684,6 +684,13 @@ function matchesItem(item, kind)
             (string.find(text, "modem", 1, true) ~= nil and string.find(text, "wireless", 1, true) ~= nil)
     end
     return false
+end
+
+function optionalItemDetail(slot)
+    if not turtle or type(turtle.getItemDetail)~="function" then return nil end
+    local ok,item=pcall(turtle.getItemDetail,slot)
+    if ok and type(item)=="table" then return item end
+    return nil
 end
 
 function wrapInventory(side)

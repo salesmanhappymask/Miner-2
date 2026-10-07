@@ -430,7 +430,7 @@ local function runNavigator(cfg)
         end
         for slot=1,16 do
             turtle.select(slot)
-            local detail=turtle.getItemDetail and turtle.getItemDetail(slot)
+            local detail=optionalItemDetail(slot)
             if turtle.getItemCount(slot)>0 and
                 (matchesItem(detail,"empty_bucket") or
                  matchesItem(detail,"lava_bucket") or

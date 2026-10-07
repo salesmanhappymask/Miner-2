@@ -25,7 +25,10 @@ end
 
 local function saveCairnState(state)
     state.schema=1
-    return saveTable(CAIRN_STATE_FILE,state)
+    if not saveTable(CAIRN_STATE_FILE,state) then
+        error("Could not save Cairn RM state; movement stopped")
+    end
+    return true
 end
 
 local function cairnSend(packet)
@@ -37,22 +40,28 @@ local function cairnSend(packet)
     return ok and result~=false
 end
 
+local function cairnInteger(value)
+    return type(value)=="number" and math.abs(value)~=math.huge and value==math.floor(value)
+end
+
 local function cairnPoint(value)
     return type(value)=="table" and
-        type(value.x)=="number" and
-        type(value.y)=="number" and
-        type(value.z)=="number"
+        cairnInteger(value.x) and
+        cairnInteger(value.y) and
+        cairnInteger(value.z)
 end
 
 local function cairnNear(a,b)
-    return cairnPoint(a) and cairnPoint(b) and
+    return type(a)=="table" and type(b)=="table" and
+        type(a.x)=="number" and type(a.y)=="number" and type(a.z)=="number" and
+        type(b.x)=="number" and type(b.y)=="number" and type(b.z)=="number" and
         math.abs(a.x-b.x)<0.25 and
         math.abs(a.y-b.y)<0.25 and
         math.abs(a.z-b.z)<0.25
 end
 
 local function cairnGridPoint(value)
-    return type(value)=="table" and type(value.x)=="number" and type(value.z)=="number"
+    return type(value)=="table" and cairnInteger(value.x) and cairnInteger(value.z)
 end
 
 local function cairnTargetSouthWest(position,gridSouthWest)
@@ -274,6 +283,8 @@ local function cairnAcceptJob(state,message)
         chunk=geometry.chunk
     }
     state.phase="READY"
+    state.active=true
+    state.error=nil
     state.docked=true
     state.dir=DIR_N
     state.current={
@@ -284,6 +295,8 @@ local function cairnAcceptJob(state,message)
     saveCairnState(state)
     return true
 end
+
+local cairnDockBelow
 
 local function cairnRunUndock(state)
     local job=state.job
@@ -308,7 +321,7 @@ local function cairnRunUndock(state)
         })
         state.phase="ERROR"
         state.error=reason
-        state.docked=true
+        state.docked=cairnDockBelow()
         saveCairnState(state)
         return false,reason
     end
@@ -387,7 +400,7 @@ local function cairnRunUndock(state)
     return true
 end
 
-local function cairnDockBelow()
+cairnDockBelow=function()
     local okKind,kind=pcall(peripheral.getType,"bottom")
     if not okKind then kind=nil end
     local okId,id=pcall(peripheral.call,"bottom","getID")
@@ -487,7 +500,7 @@ local function waitForCairnJob()
                     if not ok then
                         state.phase="ERROR"
                         state.error=reason
-                        state.docked=true
+                        state.docked=cairnDockBelow()
                         saveCairnState(state)
                         cairnSend({
                             type="quarry_error",
@@ -502,12 +515,10 @@ local function waitForCairnJob()
             elseif message.type=="quarry_status_query" and state.job then
                 if state.phase=="DOCKED" and cairnDockBelow() and
                     tostring(message.jobToken or "")==tostring(state.job.jobToken or "") then
-                    state.phase="READY"
-                    saveCairnState(state)
                     cairnSend({
-                        type="quarry_ready",
+                        type=state.active==false and "quarry_complete" or "quarry_ready",
                         jobToken=state.job.jobToken,
-                        phase="READY"
+                        phase=state.active==false and "DOCKED" or "READY"
                     })
                 else
                     cairnSend({
@@ -526,6 +537,10 @@ end
 
 local function runManagerSeedBootstrap()
     local cairnState=waitForCairnJob()
+
+    if cairnState and cairnState.phase=="ERROR" and cairnState.docked~=true then
+        error(cairnState.error or "Cairn undock recovery requires position verification")
+    end
 
     if cairnState and cairnState.phase=="UNDOCKING" then
         local ok,reason=cairnRunUndock(cairnState)
@@ -3490,10 +3505,8 @@ local function runRegionalManager()
         end
         local previous=turtle.getSelectedSlot()
         local function detail(slot)
-            if turtle.getItemDetail then
-                local ok,item=pcall(turtle.getItemDetail,slot)
-                if ok and item then return item end
-            end
+            local item=optionalItemDetail(slot)
+            if item then return item end
             return selfItem(slot)
         end
         while turtle.getFuelLevel()<target do
@@ -3769,10 +3782,8 @@ local function runRegionalManager()
 
     local function managerOwnItem(slot)
         if not slot or slot<1 or slot>16 or turtle.getItemCount(slot)<=0 then return nil end
-        if turtle.getItemDetail then
-            local ok,item=pcall(turtle.getItemDetail,slot)
-            if ok and item then return item end
-        end
+        local item=optionalItemDetail(slot)
+        if item then return item end
         return selfItem(slot)
     end
 

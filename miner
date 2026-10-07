@@ -488,7 +488,7 @@ local function runMinerCommissioning(cfg)
                     for slot=1,16 do
                         turtle.select(slot)
                         if turtle.getItemCount(slot)>0 and not turtle.refuel(0) then
-                            local detail=turtle.getItemDetail and turtle.getItemDetail(slot)
+                            local detail=optionalItemDetail(slot)
                             if matchesItem(detail,"empty_bucket") or
                                 (not detail and burned[slot]) then
                                 bucketCount=bucketCount+turtle.getItemCount(slot)
@@ -2724,7 +2724,7 @@ local function runMiner(cfg)
         if turtle.getFuelLevel()~="unlimited" then
             for _,priority in ipairs(FUEL_PRIORITY) do
                 for slot=1,16 do
-                    local detail=turtle.getItemDetail and turtle.getItemDetail(slot)
+                    local detail=optionalItemDetail(slot)
                     if matchesItem(detail,priority) or
                         (not detail and kind==priority and turtle.getItemCount(slot)>0) then
                         turtle.select(slot)
@@ -2741,7 +2741,7 @@ local function runMiner(cfg)
         for slot=1,16 do
             if turtle.getItemCount(slot)>0 then
                 turtle.select(slot)
-                local detail=turtle.getItemDetail and turtle.getItemDetail(slot)
+                local detail=optionalItemDetail(slot)
                 local empty=matchesItem(detail,"empty_bucket") or
                     (kind=="lava_bucket" and burned[slot] and not turtle.refuel(0))
                 local unusedLava=matchesItem(detail,"lava_bucket") or
