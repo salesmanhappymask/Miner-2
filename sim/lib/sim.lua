@@ -170,7 +170,7 @@ function Sim:serverStop(kind, downtime)
         self:log("SERVER", "*** server back up ***")
         if kind ~= "crash" then self:autosave() end
         for _, m in ipairs(self.machines) do
-            if wasOn[m] then
+            if wasOn[m] or m.bootPending then
                 self.sched:after(0.05 + 0.05 * (m.id % 7), function() m:boot("server start") end)
             end
         end

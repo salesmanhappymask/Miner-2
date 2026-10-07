@@ -6,6 +6,7 @@ rm -rf out/suite
 mkdir -p out/suite
 
 scenarios() {
+  [ "$mode" = restarts ] && { echo ""; for t in $(seq 5 1.3 320); do echo "events=restart@$t"; done; for t in $(seq 5 2.9 320); do echo "events=crash@$t"; done; return; }
   echo ""
   echo "return=0"
   echo "dest=60,64,230"

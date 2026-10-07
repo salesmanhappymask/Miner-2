@@ -322,7 +322,7 @@ function Scenario:returnRm()
     m.files.startup = RETURN_STUB
     sim:log("SCENARIO", "RM return is simulated: it is placed on the dock and answers quarry_complete")
     self.rmReturnedAt = sim.sched.now
-    m:boot("scenario: back on the dock")
+    m:requestBoot(0.05, "scenario: back on the dock")
 end
 
 function Scenario:done()
