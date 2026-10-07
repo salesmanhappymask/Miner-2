@@ -2633,83 +2633,116 @@ local function runRegionalManager()
         flushManager(true)
     end
 
+    local function originText(o)
+        if type(o)~="table" then return "none" end
+        return tostring(o.x)..","..tostring(o.y)..","..tostring(o.z)
+    end
+
     local function validateRegistration(sender,message)
-        if message.version~=VERSION or tonumber(message.managerId)~=managerId then
-            return false
+        if message.version~=VERSION then
+            return false,"Release mismatch: node v"..tostring(message.version)..", Regional Manager v"..tostring(VERSION)
+        end
+        if tonumber(message.managerId)~=managerId then
+            return false,"Node is paired with Regional Manager "..tostring(message.managerId)..", not "..tostring(managerId)
         end
 
         local existingSender=data.nodes and data.nodes[sender] or nil
         if existingSender then
-            if existingSender.role~=message.role then return false end
-            if message.role=="miner" and tonumber(existingSender.row)~=tonumber(message.row) then return false end
-            if message.role=="foreman" and tonumber(existingSender.number)~=tonumber(message.number) then return false end
-            if message.role=="navigator" and tonumber(existingSender.number)~=tonumber(message.number) then return false end
+            if existingSender.role~=message.role then
+                return false,"Computer "..tostring(sender).." is already registered as "..tostring(existingSender.role)
+            end
+            if message.role=="miner" and tonumber(existingSender.row)~=tonumber(message.row) then
+                return false,"Computer "..tostring(sender).." is already registered as Miner-"..tostring(existingSender.row)
+            end
+            if (message.role=="foreman" or message.role=="navigator") and
+                tonumber(existingSender.number)~=tonumber(message.number) then
+                return false,"Computer "..tostring(sender).." is already registered as "..tostring(message.role).."-"..tostring(existingSender.number)
+            end
         end
 
         if data.session and message.session~=data.session then
-            return false
+            return false,"Session mismatch: node has "..tostring(message.session)..", Regional Manager has "..tostring(data.session)..". Re-pair the Master Foreman"
         end
 
         if tonumber(message.masterForemanId)~=tonumber(data.masterForemanId) then
-            return false
+            return false,"Master Foreman mismatch: node expects "..tostring(message.masterForemanId)..", Regional Manager has "..tostring(data.masterForemanId)
         end
 
         local origin=message.worldOrigin
         if type(origin)~="table" or type(origin.x)~="number" or
             type(origin.y)~="number" or type(origin.z)~="number" then
-            return false
+            return false,"Node sent no world origin"
         end
         if data.worldOrigin then
             if data.worldOrigin.x~=origin.x or data.worldOrigin.y~=origin.y or
-                data.worldOrigin.z~=origin.z then return false end
+                data.worldOrigin.z~=origin.z then
+                return false,"World origin mismatch: node "..originText(origin)..", Regional Manager "..originText(data.worldOrigin)
+            end
         elseif sender~=data.masterForemanId or message.role~="foreman" or
             tonumber(message.number)~=1 then
-            return false
+            return false,"Regional Manager has no world origin yet; Foreman-1 must register first"
         end
 
         if message.role=="foreman" then
             local n=tonumber(message.number)
-            if not n or n<1 or n>4 then return false end
+            if not n or n<1 or n>4 then return false,"Foreman number "..tostring(message.number).." is not 1 to 4" end
             local existing=data.foremen and data.foremen[n] or nil
-            if existing and existing.id and tonumber(existing.id)~=tonumber(sender) then return false end
-            if n==1 and sender~=data.masterForemanId then return false end
+            if existing and existing.id and tonumber(existing.id)~=tonumber(sender) then
+                return false,"Foreman-"..tostring(n).." is already computer "..tostring(existing.id)
+            end
+            if n==1 and sender~=data.masterForemanId then
+                return false,"Foreman-1 must be the paired Master Foreman "..tostring(data.masterForemanId)
+            end
             if tonumber(message.rowStart)~=((n-1)*4+1) or tonumber(message.rowEnd)~=(n*4) then
-                return false
+                return false,"Foreman-"..tostring(n).." rows "..tostring(message.rowStart).."-"..tostring(message.rowEnd)..
+                    ", expected "..tostring((n-1)*4+1).."-"..tostring(n*4)
             end
             return true
         elseif message.role=="miner" then
             local row=tonumber(message.row)
-            if not row or row<1 or row>16 then return false end
+            if not row or row<1 or row>16 then return false,"Miner row "..tostring(message.row).." is not 1 to 16" end
             local existing=data.miners and data.miners[row] or nil
-            if existing and existing.id and tonumber(existing.id)~=tonumber(sender) then return false end
+            if existing and existing.id and tonumber(existing.id)~=tonumber(sender) then
+                return false,"Miner-"..tostring(row).." is already computer "..tostring(existing.id)
+            end
             local n=expectedForemanForRow(row)
-            if tonumber(message.foremanNumber)~=n then return false end
+            if tonumber(message.foremanNumber)~=n then
+                return false,"Miner-"..tostring(row).." belongs to Foreman-"..tostring(n)..", not Foreman-"..tostring(message.foremanNumber)
+            end
             local f=data.foremen[n]
             if f and f.id and tonumber(message.foremanId)~=tonumber(f.id) then
-                return false
+                return false,"Miner-"..tostring(row).." names Foreman computer "..tostring(message.foremanId)..", registered Foreman-"..tostring(n).." is "..tostring(f.id)
             end
             return true
         elseif message.role=="navigator" then
             local n=tonumber(message.number)
             local existing=data.navigators and data.navigators[n] or nil
-            if existing and existing.id and tonumber(existing.id)~=tonumber(sender) then return false end
+            if existing and existing.id and tonumber(existing.id)~=tonumber(sender) then
+                return false,"Navigator-"..tostring(n).." is already computer "..tostring(existing.id)
+            end
             local site=NAVIGATOR_SITES[n]
-            if not site then return false end
-            return tonumber(message.x)==site.x and
-                tonumber(message.y)==site.y and
-                tonumber(message.z)==site.z
+            if not site then return false,"Navigator number "..tostring(message.number).." has no site" end
+            if tonumber(message.x)==site.x and tonumber(message.y)==site.y and tonumber(message.z)==site.z then
+                return true
+            end
+            return false,"Navigator-"..tostring(n).." is at "..tostring(message.x)..","..tostring(message.y)..","..tostring(message.z)..
+                ", its site is "..tostring(site.x)..","..tostring(site.y)..","..tostring(site.z)
         end
 
-        return false
+        return false,"Unknown role "..tostring(message.role)
     end
 
     local function registerNode(sender,message)
-        if not validateRegistration(sender,message) then
+        local valid,reason=validateRegistration(sender,message)
+        if not valid then
+            reason=reason or "Manifest mismatch"
+            pairStatus="Rejected "..tostring(sender)..": "..reason
+            if debugLog then pcall(debugLog,"REGISTER","rejected "..tostring(sender)..": "..reason,"WARN") end
             send(sender,{
                 type="registration_error",
                 version=VERSION,
                 id=sender,
-                reason="Manifest mismatch"
+                reason=reason
             })
             return
         end
@@ -5243,7 +5276,12 @@ local function runRegionalManager()
                             managerId=managerId,
                             masterForemanId=sender,
                             session=data.session,
-                            nonce=message.nonce
+                            nonce=message.nonce,
+                            worldOrigin=data.worldOrigin and {
+                                x=data.worldOrigin.x,
+                                y=data.worldOrigin.y,
+                                z=data.worldOrigin.z
+                            } or nil
                         })
                         pairStatus="Pair confirmed with Master " .. tostring(sender)
                         drawTerminal()
