@@ -83,7 +83,7 @@ while true do
             type = "quarry_complete",
             jobToken = msg.jobToken,
             phase = "DOCKED",
-            version = 169,
+            version = 170,
             rmId = os.getComputerID()
         }, "cairn.quarry.v2")
     end
@@ -111,7 +111,7 @@ function Scenario.new(sim, opts)
     local dsx = s.grid.x + math.floor((s.dest.x - s.grid.x) / 16) * 16
     local dsz = s.grid.z + math.ceil((s.dest.z - s.grid.z) / 16) * 16
     s.expectedSeed = { x = dsx - 1, y = s.dest.y - 3, z = dsz + 1 }
-    s.expectedDock = { x = s.dest.x, y = s.dest.y + 1, z = s.dest.z - 4 }
+    s.expectedDock = { x = s.dest.x, y = s.dest.y + 1, z = s.dest.z }
     return s
 end
 
@@ -120,7 +120,14 @@ function Scenario:build()
     local w = sim.world
     local x, y, z = self.start.x, self.start.y, self.start.z
     w.groundTop = math.min(self.start.y, self.dest.y) - 4
-    for dz = 1, 3 do w:addCarriage(x, y, z - dz) end
+    w:addCarriage(x, y, z - 2)
+    w:set(x, y, z - 1, { kind = "solid", name = "carriage_engine", unbreakable = true })
+    w:set(x, y, z - 3, { kind = "solid", name = "carriage_engine", unbreakable = true })
+    w:set(x, y + 1, z - 4, { kind = "solid", name = "rednet_cable" })
+    w:set(x, y + 1, z - 3, { kind = "solid", name = "rednet_cable" })
+    w:set(x, y - 1, z, { kind = "solid", name = "rednet_cable" })
+    w:set(x, y - 1, z - 1, { kind = "solid", name = "rednet_cable" })
+    w:set(x, y - 1, z - 2, { kind = "solid", name = "ender_chest" })
 
     local cairn = readProgram(o.cairnDir, "cairn")
     local cairnStartup = readProgram(o.cairnDir, "startup")
@@ -159,7 +166,7 @@ function Scenario:build()
     local version = readProgram(o.swarmDir, "version"):match("%d+")
     self.rm = sim:addMachine({
         id = RM_ID, name = "RM", kind = "turtle", label = "Regional Manager",
-        x = x, y = y + 1, z = z - 4, facing = 0, fuel = o.rmFuel or 5000,
+        x = x, y = y + 1, z = z, facing = 0, fuel = o.rmFuel or 5000,
         files = {
             startup = startup,
             common = readProgram(o.swarmDir, "common"),
@@ -311,10 +318,10 @@ end
 function Scenario:returnRm()
     local sim, m = self.sim, self.rm
     if m.on then return end
-    local d1 = self.drive1
-    local dock = { x = d1.x, y = d1.y + 1, z = d1.z }
+    local d2 = self.drive2
+    local dock = { x = d2.x, y = d2.y + 1, z = d2.z }
     if not sim.world:isAir(dock.x, dock.y, dock.z) then
-        sim:violation("RM_RETURN", "the dock above Drive1 is blocked at " .. U.posText(dock))
+        sim:violation("RM_RETURN", "the dock above Drive2 is blocked at " .. U.posText(dock))
         return
     end
     sim.world:set(m.x, m.y, m.z, nil)
@@ -337,7 +344,7 @@ function Scenario:safeStop()
     local reasons = {}
     for _, e in ipairs(self.rmErrors) do
         if e:find("reconciliation", 1, true) or e:find("requires cancellation", 1, true) or
-            e:find("not docked on Drive1", 1, true) then
+            e:find("not docked on Drive2", 1, true) then
             reasons[#reasons + 1] = "RM stopped: " .. e
         end
     end
@@ -364,8 +371,8 @@ function Scenario:finalChecks()
             sim:violation("CAIRN_RETURN", "Cairn finished at " .. U.posText(actual) .. ", it started at " .. U.posText(self.start))
         end
         local rm = self.rm
-        if not (rm.x == d2.x and rm.y == d2.y + 1 and rm.z == d2.z - 4) then
-            sim:violation("RM_DOCK", "RM is not on the Drive1 dock at the end")
+        if not (rm.x == d2.x and rm.y == d2.y + 1 and rm.z == d2.z) then
+            sim:violation("RM_DOCK", "RM is not on the Drive2 dock at the end")
         end
     end
 end

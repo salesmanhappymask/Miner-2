@@ -17,7 +17,8 @@ scenarios() {
   for t in $(seq 9.0 0.05 16.0); do echo "events=reboot:Drive1@$t"; done
   for t in $(seq 9.0 0.05 16.0); do echo "events=reboot:Drive2@$t"; done
   for t in $(seq 92.0 0.05 99.0); do echo "events=reboot:Drive2@$t"; done
-  for t in $(seq 144.0 0.1 163.0); do echo "events=reboot:RM@$t"; done
+  for t in $(seq 144.0 0.05 163.0); do echo "events=reboot:RM@$t"; done
+  for t in $(seq 144.0 0.3 160.0); do for d in 1.1 2.3 3.6; do echo "events=reboot:RM@$t,reboot:RM@$(echo "$t + $d" | bc)"; done; done
   for t in $(seq 5 1.3 320); do echo "events=restart@$t"; done
   for t in $(seq 5 2.9 320); do echo "events=crash@$t"; done
 }

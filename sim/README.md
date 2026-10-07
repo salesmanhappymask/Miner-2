@@ -40,15 +40,17 @@ bash sim/fetch_rom.sh /path/to/ComputerCraft1.63.jar
 This extracts the ROM to `sim/ccrom/` (ignored by git, since the ROM belongs
 to ComputerCraft).
 
-The programs are read from two folders. By default these are `cairn/` for
-Cairn and the repository root for the Quarry Swarm. Point them elsewhere with
-`cairn=` and `swarm=` or the `SIM_CAIRN` and `SIM_SWARM` variables.
+The programs are read from two folders: the Quarry Swarm from this
+repository's root, and Cairn from `cairn/` in this repository once Cairn is
+merged in. Until then, clone the Cairn repository and point the simulator at
+it with `cairn=` or the `SIM_CAIRN` variable. `swarm=` or `SIM_SWARM` picks a
+different Quarry Swarm folder.
 
 ## Running one scenario
 
 ```
 cd sim
-luajit run.lua cairn=../path/to/Cairn_v40 swarm=../path/to/Quarry_Swarm_v169
+luajit run.lua cairn=/path/to/Cairn
 ```
 
 Options are `name=value` arguments, or `SIM_NAME` environment variables:
@@ -82,10 +84,12 @@ Events:
 
 ## What the scenario does
 
-`scenarios/cairn_quarry.lua` builds Drive2 (2700), Drive1 (2701) four blocks
-north, three carriage blocks between them, the RM docked on top of Drive1
-facing north, and a stand-in for the controller (2705) that sends
-`set_chunk_grid` and then `quarry`. Drive2's state is pre-seeded with its true
+`scenarios/cairn_quarry.lua` builds the carriage as it is in the game: Drive2
+(2700), a carriage engine, the carriage, a second engine, and Drive1 (2701)
+four blocks north of Drive2. The Down cable runs over Drive1 and the north
+engine, the Up cable under Drive2 and the south engine, and the ender chest
+hangs under the carriage. The RM is docked on top of Drive2 facing north. A
+stand-in for the controller (2705) sends `set_chunk_grid` and then `quarry`. Drive2's state is pre-seeded with its true
 position, as if typed in after a clean install.
 
 Cairn and the RM run their real programs. When the RM saves the `DEPLOYING`
@@ -106,6 +110,10 @@ The checks:
 - No turtle may dig or attack a computer or the carriage, and no program may
   loop without yielding.
 
+Modem distances are measured from the computer itself, as ComputerCraft 1.63
+does for a modem attached to a computer, so the RM's range checks against
+Drive2 and Drive1 behave as they do in the game.
+
 Results:
 
 | Result | Meaning |
@@ -122,13 +130,15 @@ computer printed).
 ## The sweep
 
 ```
-bash sim/suite.sh          # about 1,100 runs
-bash sim/suite.sh quick    # 6 runs
+SIM_CAIRN=/path/to/Cairn bash sim/suite.sh            # about 1,500 runs
+SIM_CAIRN=/path/to/Cairn bash sim/suite.sh quick      # 6 runs
+SIM_CAIRN=/path/to/Cairn bash sim/suite.sh restarts   # server restarts and crashes only
 ```
 
 It runs routes in several directions (including negative coordinates), a
 route that has to climb and descend, and reboots, server restarts and crashes
-at closely spaced times across the trip. Runs that do not pass keep their
+at closely spaced times across the trip, including a second RM reboot while
+it is still recovering from the first. Runs that do not pass keep their
 logs in `out/suite/<run>/`.
 
 ## Files
