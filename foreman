@@ -5651,9 +5651,26 @@ local function runMaster()
         error("Unsupported Master Foreman state version. Clear node.cfg and foreman state only if this node cannot be migrated safely.")
     end
 
+    local function adoptManagerOrigin(origin)
+        if type(origin)~="table" then return end
+        if worldOrigin.x==origin.x and worldOrigin.y==origin.y and worldOrigin.z==origin.z then return end
+        if debugLog then
+            pcall(debugLog,"PAIR","world origin "..tostring(worldOrigin.x)..","..tostring(worldOrigin.y)..","..
+                tostring(worldOrigin.z).." replaced by Regional Manager origin "..tostring(origin.x)..","..
+                tostring(origin.y)..","..tostring(origin.z),"WARN")
+        end
+        worldOrigin={x=origin.x,y=origin.y,z=origin.z}
+        anchor={x=origin.x,y=origin.y,z=origin.z+1}
+        if not saveTable("world_anchor",anchor) then
+            error("Could not save the Regional Manager world anchor")
+        end
+        if cfg then cfg.worldOrigin=worldOrigin end
+    end
+
     if not cfg then
         newMaster=true
-        local managerId,session=pairMasterWithRegionalManager()
+        local managerId,session,managerOrigin=pairMasterWithRegionalManager()
+        adoptManagerOrigin(managerOrigin)
 
         cfg={
             version=VERSION,
@@ -5711,7 +5728,8 @@ local function runMaster()
         end
 
         if not cfg.managerId or not cfg.session or not registerNodeWithManager(cfg,3) then
-            local managerId,session=pairMasterWithRegionalManager()
+            local managerId,session,managerOrigin=pairMasterWithRegionalManager()
+            adoptManagerOrigin(managerOrigin)
             cfg.managerId=managerId
             cfg.masterForemanId=id
             cfg.session=session
@@ -5722,8 +5740,9 @@ local function runMaster()
 
     setRegionalManager(cfg.managerId)
 
-    if not registerNodeWithManager(cfg) then
-        error("Master Foreman could not register with Regional Manager")
+    local registered,rejection=registerNodeWithManager(cfg)
+    if not registered then
+        error("Master Foreman could not register with Regional Manager: "..tostring(rejection or "no reply"))
     end
 
     local state=loadTableLight("foreman1.tmp")

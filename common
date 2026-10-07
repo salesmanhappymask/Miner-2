@@ -1,4 +1,4 @@
-VERSION = 170
+VERSION = 171
 RELEASE_VERSION = VERSION
 STATE_SCHEMA_VERSION = 155
 PROTOCOL_VERSION = 121
@@ -1229,7 +1229,12 @@ function pairMasterWithRegionalManager()
                         nonce=m.nonce
                     })
                     setRegionalManager(sender)
-                    return sender,m.session
+                    local origin=m.worldOrigin
+                    if type(origin)~="table" or type(origin.x)~="number" or
+                        type(origin.y)~="number" or type(origin.z)~="number" then
+                        origin=nil
+                    end
+                    return sender,m.session,origin
                 end
             end
             showPairing("Offer timed out / retrying")
@@ -1267,6 +1272,7 @@ function registerNodeWithManager(cfg,timeout)
 
     local deadline=now()+(tonumber(timeout) or 15)
     local lastSend=-10
+    local rejection=nil
 
     while now()<deadline do
         if now()-lastSend>=1 then
@@ -1275,6 +1281,17 @@ function registerNodeWithManager(cfg,timeout)
         end
 
         local sender,message=rednet.receive(PROTOCOL,0.5)
+
+        if sender==managerId and type(message)=="table" and
+            message.type=="registration_error" and tonumber(message.id)==os.getComputerID() then
+            local reason=tostring(message.reason or "no reason given")
+            if reason~=rejection then
+                rejection=reason
+                LAST_REGISTRATION_ERROR=reason
+                if debugLog then pcall(debugLog,"REGISTER","rejected: "..reason,"WARN") end
+                print("Registration rejected: "..reason)
+            end
+        end
 
         if sender==managerId and type(message)=="table" and
             message.type=="node_registered" and message.version==VERSION and
@@ -1299,20 +1316,27 @@ function registerNodeWithManager(cfg,timeout)
                 end
             end
 
+            LAST_REGISTRATION_ERROR=nil
             return true
         end
     end
 
-    return false
+    return false,rejection
 end
 
 function ensureManagerRegistration(cfg)
-    while not registerNodeWithManager(cfg) do
+    while true do
+        local ok,reason=registerNodeWithManager(cfg)
+        if ok then break end
         term.setBackgroundColor(colors.black)
         term.setTextColor(colors.white)
         term.clear()
         term.setCursorPos(1,1)
         print("Waiting for Regional Manager...")
+        if reason then
+            print("")
+            print("Rejected: "..tostring(reason))
+        end
         sleep(2)
     end
     return true
