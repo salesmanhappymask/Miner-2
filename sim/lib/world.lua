@@ -217,10 +217,8 @@ function World:finishMotion()
     end
     for _, m in ipairs(pm.machines) do
         m.inTransit = false
-        if m.wasOnBeforeMotion and not self.sim.serverDown then
-            self.sim.sched:after(0.05, function() m:boot("after carriage motion") end)
-        elseif m.wasOnBeforeMotion then
-            m.bootWhenServerUp = true
+        if m.wasOnBeforeMotion then
+            m:requestBoot(0.05, "after carriage motion")
         end
     end
     self.sim:log("RIM", "carriage motion complete, anchor " .. U.posText(self.anchor))

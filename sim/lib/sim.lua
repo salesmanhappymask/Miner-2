@@ -157,8 +157,7 @@ function Sim:serverStop(kind, downtime)
     end
     local wasOn = {}
     for _, m in ipairs(self.machines) do
-        if m.on or m.inTransit or m.bootWhenServerUp or m.bootPending then wasOn[m] = true end
-        m.bootWhenServerUp = nil
+        if m.on or m.inTransit or m.bootPending then wasOn[m] = true end
         m:powerOff("server " .. kind)
     end
     if kind == "crash" and self.saved then
